@@ -306,7 +306,26 @@ impl From<HashMap<String, String>> for CStringMap {
     }
 }
 
+/// Visit all values in a CStringMap. The callback will be called once for each element of the map
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CStringMap`] pointer and callback
 #[no_mangle]
+pub unsafe extern "C" fn visit_string_map(
+    map: &CStringMap,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    )
+) {
+    for (key, val) in map.values.iter() {
+        visitor(engine_context, kernel_string_slice!(key), kernel_string_slice!(val));
+    }
+}
+
 /// allow probing into a CStringMap. If the specified key is in the map, kernel will call
 /// allocate_fn with the value associated with the key and return the value returned from that
 /// function. If the key is not in the map, this will return NULL
@@ -314,6 +333,7 @@ impl From<HashMap<String, String>> for CStringMap {
 /// # Safety
 ///
 /// The engine is responsible for providing a valid [`CStringMap`] pointer and [`KernelStringSlice`]
+#[no_mangle]
 pub unsafe extern "C" fn get_from_string_map(
     map: &CStringMap,
     key: KernelStringSlice,
