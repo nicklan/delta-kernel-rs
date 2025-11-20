@@ -15,19 +15,11 @@ use crate::{
     DeltaResult, Engine, EngineData, Error,
 };
 use roaring::RoaringTreemap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
-
-/// State that doesn't change between scans
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GlobalScanState {
-    pub table_root: String,
-    pub partition_columns: Vec<String>,
-    pub logical_schema: SchemaRef,
-    pub physical_schema: SchemaRef,
-}
+use super::ScanMetadata;
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -106,16 +98,16 @@ pub fn transform_to_logical(
     physical_data: Box<dyn EngineData>,
     physical_schema: &SchemaRef,
     logical_schema: &Schema,
-    transform: &Option<ExpressionRef>,
+    transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
-        Some(ref transform) => engine
+        Some(transform) => engine
             .evaluation_handler()
             .new_expression_evaluator(
                 physical_schema.clone(),
-                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
-                logical_schema.clone().into(),
-            )
+                transform,
+                logical_schema.clone().into(), // TODO: expensive deep clone!
+            )?
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),
     }
@@ -152,33 +144,26 @@ pub type ScanCallback<T> = fn(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data { // scan data from scan.scan_data()
-///     let (data, vector) = res?;
-///     context = delta_kernel::scan::state::visit_scan_files(
-///        data.as_ref(),
-///        selection_vector,
+/// for res in scan_metadata_iter { // scan metadata iterator from scan.scan_metadata()
+///     let scan_metadata = res?;
+///     context = scan_metadata.visit_scan_files(
 ///        context,
 ///        my_callback,
 ///     )?;
 /// }
 /// ```
-pub fn visit_scan_files<T>(
-    data: &dyn EngineData,
-    selection_vector: &[bool],
-    transforms: &[Option<ExpressionRef>],
-    context: T,
-    callback: ScanCallback<T>,
-) -> DeltaResult<T> {
-    let mut visitor = ScanFileVisitor {
-        callback,
-        selection_vector,
-        transforms,
-        context,
-    };
-    visitor.visit_rows_of(data)?;
-    Ok(visitor.context)
+impl ScanMetadata {
+    pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
+        let mut visitor = ScanFileVisitor {
+            callback,
+            selection_vector: self.scan_files.selection_vector(),
+            transforms: &self.scan_file_transforms,
+            context,
+        };
+        visitor.visit_rows_of(self.scan_files.data())?;
+        Ok(visitor.context)
+    }
 }
-
 // add some visitor magic for engines
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
@@ -194,7 +179,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 10,
+            getters.len() == 13,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
@@ -244,7 +229,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::actions::get_log_schema;
+    use crate::actions::get_commit_schema;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
     use crate::ExpressionRef;
 
@@ -281,10 +266,10 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_visit_scan_data() {
+    fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
-            vec![add_batch_simple(get_log_schema().clone())],
+            vec![add_batch_simple(get_commit_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],

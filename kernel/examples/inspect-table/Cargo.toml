@@ -5,16 +5,15 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow = "53"
 clap = { version = "4.5", features = ["derive"] }
+common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
-  "cloud",
-  "arrow_53",
-  "default-engine",
-  "developer-visibility",
+  "arrow",
+  "default-engine-rustls",
+  "internal-api",
 ] }
-env_logger = "0.11.3"
-url = "2"
+env_logger = "0.11.8"
 
+# for cargo-release
 [package.metadata.release]
 release = false

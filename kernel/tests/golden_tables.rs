@@ -3,28 +3,32 @@
 //! Data (golden tables) are stored in tests/golden_data/<table_name>.tar.zst
 //! Each table directory has a table/ and expected/ subdirectory with the input/output respectively
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use delta_kernel::arrow::array::{Array, AsArray, StructArray};
 use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
-use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use itertools::Itertools;
-use paste::paste;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
+use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Table};
-use futures::{stream::TryStreamExt, StreamExt};
-use object_store::{local::LocalFileSystem, ObjectStore};
 
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::{DeltaResult, Snapshot};
+
+use futures::{stream::TryStreamExt, StreamExt};
+use itertools::Itertools;
+use object_store::{local::LocalFileSystem, ObjectStore};
+use paste::paste;
+use url::Url;
 
 mod common;
-use common::{load_test_data, to_arrow};
+
+use test_utils::{load_test_data, to_arrow};
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
@@ -35,7 +39,7 @@ async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta);
+                let reader = ParquetObjectReader::new(store.clone(), meta.location);
                 let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
@@ -161,29 +165,19 @@ fn assert_eq(actual: &StructArray, expected: &StructArray) {
 // do a full table scan at the latest snapshot of the table and compare with the expected data
 async fn latest_snapshot_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
-    table: Table,
+    url: Url,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = table.snapshot(&engine, None)?;
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
+        .map(|result| -> DeltaResult<_> { to_arrow(result?) })
         .try_collect()?;
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
 
-    let schema: Arc<Schema> = Arc::new(scan.schema().as_ref().try_into()?);
+    let schema = Arc::new(Schema::try_from_kernel(scan.logical_schema().as_ref())?);
     let result = concat_batches(&schema, &batches)?;
     let result = sort_record_batch(result)?;
     let expected = sort_record_batch(expected)?;
@@ -199,24 +193,20 @@ fn setup_golden_table(
     test_name: &str,
 ) -> (
     DefaultEngine<TokioBackgroundExecutor>,
-    Table,
+    Url,
     Option<PathBuf>,
     tempfile::TempDir,
 ) {
     let test_dir = load_test_data("tests/golden_data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     let table_path = test_path.join("delta");
-    let table = Table::try_from_uri(table_path.to_str().expect("table path to string"))
+    let url = delta_kernel::try_parse_uri(table_path.to_str().expect("table path to string"))
         .expect("table from uri");
-    let engine = DefaultEngine::try_new(
-        table.location(),
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )
-    .unwrap();
+    let engine = Arc::try_unwrap(test_utils::create_default_engine(&url).unwrap())
+        .expect("Arc should have single reference");
     let expected_path = test_path.join("expected");
     let expected_path = expected_path.exists().then_some(expected_path);
-    (engine, table, expected_path, test_dir)
+    (engine, url, expected_path, test_dir)
 }
 
 // same as golden_test but we expect the test to fail
@@ -263,35 +253,32 @@ macro_rules! golden_test {
 #[allow(dead_code)]
 async fn canonicalized_paths_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
-    table: Table,
+    table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // assert latest version is 1 and there are no files in the snapshot (add is removed)
-    let snapshot = table.snapshot(&engine, None).unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.version(), 1);
-    let scan = snapshot
-        .into_scan_builder()
-        .build()
-        .expect("build the scan");
-    let mut scan_data = scan.scan_data(&engine).expect("scan data");
-    assert!(scan_data.next().is_none());
+    let scan = snapshot.scan_builder().build().expect("build the scan");
+    let mut scan_metadata = scan.scan_metadata(&engine).expect("scan metadata");
+    assert!(scan_metadata.next().is_none());
     Ok(())
 }
 
 async fn checkpoint_test(
     engine: DefaultEngine<TokioBackgroundExecutor>,
-    table: Table,
+    table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = table.snapshot(&engine, None).unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let version = snapshot.version();
-    let scan = snapshot
-        .into_scan_builder()
-        .build()
-        .expect("build the scan");
-    let scan_data: Vec<_> = scan.scan_data(&engine).expect("scan data").collect();
+    let scan = snapshot.scan_builder().build().expect("build the scan");
+    let scan_metadata: Vec<_> = scan
+        .scan_metadata(&engine)
+        .expect("scan metadata")
+        .collect();
     assert_eq!(version, 14);
-    assert!(scan_data.len() == 1);
+    assert!(scan_metadata.len() == 1);
     Ok(())
 }
 
@@ -336,7 +323,7 @@ golden_test!(
 skip_test!("data-reader-partition-values": "Golden data needs to have 2021-09-08T11:11:11+00:00 as expected value for as_timestamp col");
 golden_test!("data-reader-primitives", latest_snapshot_test);
 golden_test!("data-reader-timestamp_ntz", latest_snapshot_test);
-skip_test!("data-reader-timestamp_ntz-id-mode": "id column mapping mode not supported");
+golden_test!("data-reader-timestamp_ntz-id-mode", latest_snapshot_test);
 golden_test!("data-reader-timestamp_ntz-name-mode", latest_snapshot_test);
 
 // TODO test with predicate
@@ -397,8 +384,7 @@ golden_test!("snapshot-repartitioned", latest_snapshot_test);
 golden_test!("snapshot-vacuumed", latest_snapshot_test);
 
 golden_test!("table-with-columnmapping-mode-name", latest_snapshot_test);
-// TODO fix column mapping
-skip_test!("table-with-columnmapping-mode-id": "id column mapping mode not supported");
+golden_test!("table-with-columnmapping-mode-id", latest_snapshot_test);
 
 // TODO scan at different versions
 golden_test!("time-travel-partition-changes-a", latest_snapshot_test);

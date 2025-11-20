@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -17,6 +16,7 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
 use crate::schema::Schema;
@@ -38,64 +38,40 @@ pub struct DefaultEngine<E: TaskExecutor> {
     storage: Arc<ObjectStoreStorageHandler<E>>,
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
-    expression: Arc<ArrowEvaluationHandler>,
+    evaluation: Arc<ArrowEvaluationHandler>,
 }
 
-impl<E: TaskExecutor> DefaultEngine<E> {
-    /// Create a new [`DefaultEngine`] instance
+impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+    /// Create a new [`DefaultEngine`] instance with the default executor.
     ///
-    /// # Parameters
-    ///
-    /// - `table_root`: The URL of the table within storage.
-    /// - `options`: key/value pairs of options to pass to the object store.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn try_new<K, V>(
-        table_root: &Url,
-        options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
-    ) -> DeltaResult<Self>
-    where
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        // table root is the path of the table in the ObjectStore
-        let (object_store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(object_store), task_executor))
-    }
-
-    /// Create a new [`DefaultEngine`] instance
+    /// Uses `TokioBackgroundExecutor` as the default executor.
+    /// For custom executors, use [`DefaultEngine::new_with_executor`].
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    /// - `table_root_path`: The root path of the table within storage.
+    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+        Self::new_with_executor(
+            object_store,
+            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+        )
+    }
+}
+
+impl<E: TaskExecutor> DefaultEngine<E> {
+    /// Create a new [`DefaultEngine`] instance with a custom executor.
+    ///
+    /// Most users should use [`DefaultEngine::new`] instead. This method is only
+    /// needed for specialized testing scenarios (e.g., multi-threaded executors).
+    ///
+    /// # Parameters
+    ///
+    /// - `object_store`: The object store to use.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
-        // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
-        // local filesystem doesn't return a sorted list by default. Although the `object_store`
-        // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
-        // implementations actually do:
-        // - AWS:
-        //   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
-        //   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
-        //   order based on their key names." (Directory buckets are out of scope for now)
-        // - Azure: Docs state
-        //   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
-        //   "A listing operation returns an XML response that contains all or part of the requested
-        //   list. The operation returns entities in alphabetical order."
-        // - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
-        //   doesn't indicate order, but [this
-        //   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
-        //   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
-        //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
-        // So we just need to know if we're local and then if so, we sort the returned file list in
-        // `filesystem.rs`
-        let store_str = format!("{}", object_store);
-        let is_local = store_str.starts_with("LocalFileSystem");
+    pub fn new_with_executor(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
-                !is_local,
                 task_executor.clone(),
             )),
             json: Arc::new(DefaultJsonHandler::new(
@@ -107,7 +83,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 task_executor,
             )),
             object_store,
-            expression: Arc::new(ArrowEvaluationHandler {}),
+            evaluation: Arc::new(ArrowEvaluationHandler {}),
         }
     }
 
@@ -120,31 +96,25 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
-        data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
-        let input_schema: Schema = data.record_batch().schema().try_into()?;
+        let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
             output_schema.clone().into(),
-        );
+        )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
         self.parquet
-            .write_parquet_file(
-                write_context.target_dir(),
-                physical_data,
-                partition_values,
-                data_change,
-            )
+            .write_parquet_file(write_context.target_dir(), physical_data, partition_values)
             .await
     }
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-        self.expression.clone()
+        self.evaluation.clone()
     }
 
     fn storage_handler(&self) -> Arc<dyn StorageHandler> {
@@ -191,7 +161,6 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use object_store::local::LocalFileSystem;
@@ -201,7 +170,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(object_store);
         test_arrow_engine(&engine, &url);
     }
 

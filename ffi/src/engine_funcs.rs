@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, Schema, SchemaRef};
 use delta_kernel::{
-    DeltaResult, EngineData, Expression, ExpressionEvaluator, FileDataReadResultIterator,
+    DeltaResult, EngineData, Error, Expression, ExpressionEvaluator, ExpressionRef,
+    FileDataReadResultIterator,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -125,7 +126,10 @@ fn read_parquet_file_impl(
     let delta_fm = delta_kernel::FileMeta {
         location,
         last_modified: file.last_modified,
-        size: file.size,
+        size: file
+            .size
+            .try_into()
+            .map_err(|_| Error::generic_err("unable to convert to FileSize"))?,
     };
     // TODO: Plumb the predicate through the FFI?
     let data = parquet_handler.read_parquet_files(&[delta_fm], physical_schema, None)?;
@@ -152,26 +156,28 @@ pub unsafe extern "C" fn new_expression_evaluator(
     expression: &Expression,
     // TODO: Make this a data_type, and give a way for c code to go between schema <-> datatype
     output_type: Handle<SharedSchema>,
-) -> Handle<SharedExpressionEvaluator> {
+) -> ExternResult<Handle<SharedExpressionEvaluator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let input_schema = unsafe { input_schema.clone_as_arc() };
     let output_type: DataType = output_type.as_ref().clone().into();
-    new_expression_evaluator_impl(engine, input_schema, expression, output_type)
+    let expression = Arc::new(expression.clone());
+    let res = new_expression_evaluator_impl(engine.clone(), input_schema, expression, output_type);
+    res.into_extern_result(&engine.as_ref())
 }
 
 fn new_expression_evaluator_impl(
     extern_engine: Arc<dyn ExternEngine>,
     input_schema: SchemaRef,
-    expression: &Expression,
+    expression: ExpressionRef,
     output_type: DataType,
-) -> Handle<SharedExpressionEvaluator> {
+) -> DeltaResult<Handle<SharedExpressionEvaluator>> {
     let engine = extern_engine.engine();
     let evaluator = engine.evaluation_handler().new_expression_evaluator(
         input_schema,
-        expression.clone(),
+        expression,
         output_type,
-    );
-    evaluator.into()
+    )?;
+    Ok(evaluator.into())
 }
 
 /// Free an expression evaluator
@@ -180,7 +186,7 @@ fn new_expression_evaluator_impl(
 /// Caller is responsible for passing a valid handle.
 #[no_mangle]
 pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpressionEvaluator>) {
-    debug!("engine released evaluator");
+    debug!("engine released expression evaluator");
     evaluator.drop_handle();
 }
 
@@ -189,7 +195,7 @@ pub unsafe extern "C" fn free_expression_evaluator(evaluator: Handle<SharedExpre
 /// # Safety
 /// Caller is responsible for calling with a valid `Engine`, `ExclusiveEngineData`, and `Evaluator`
 #[no_mangle]
-pub unsafe extern "C" fn evaluate(
+pub unsafe extern "C" fn evaluate_expression(
     engine: Handle<SharedExternEngine>,
     batch: &mut Handle<ExclusiveEngineData>,
     evaluator: Handle<SharedExpressionEvaluator>,
@@ -197,11 +203,11 @@ pub unsafe extern "C" fn evaluate(
     let engine = unsafe { engine.clone_as_arc() };
     let batch = unsafe { batch.as_mut() };
     let evaluator = unsafe { evaluator.clone_as_arc() };
-    let res = evaluate_impl(batch, evaluator.as_ref());
+    let res = evaluate_expression_impl(batch, evaluator.as_ref());
     res.into_extern_result(&engine.as_ref())
 }
 
-fn evaluate_impl(
+fn evaluate_expression_impl(
     batch: &dyn EngineData,
     evaluator: &dyn ExpressionEvaluator,
 ) -> DeltaResult<Handle<ExclusiveEngineData>> {
@@ -211,6 +217,7 @@ fn evaluate_impl(
 #[cfg(test)]
 mod tests {
     use super::{free_expression_evaluator, new_expression_evaluator};
+    use crate::ffi_test_utils::ok_or_panic;
     use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
     use delta_kernel::{
         schema::{DataType, StructField, StructType},
@@ -219,23 +226,22 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_new_evaluator() {
-        let engine = get_default_engine();
-        let in_schema = Arc::new(StructType::new(vec![StructField::new(
-            "a",
-            DataType::LONG,
-            true,
-        )]));
+    fn test_new_expression_evaluator() {
+        let engine = get_default_engine("memory:///doesntmatter/foo");
+        let in_schema = Arc::new(
+            StructType::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
+        );
         let expr = Expression::literal(1);
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();
         unsafe {
-            let evaluator = new_expression_evaluator(
+            let result = new_expression_evaluator(
                 engine.shallow_copy(),
                 in_schema_handle.shallow_copy(),
                 &expr,
                 output_type.shallow_copy(),
             );
+            let evaluator = ok_or_panic(result);
             in_schema_handle.drop_handle();
             output_type.drop_handle();
             free_engine(engine);

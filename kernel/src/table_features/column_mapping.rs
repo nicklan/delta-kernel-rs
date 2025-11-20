@@ -1,7 +1,9 @@
 //! Code to handle column mapping, including modes and schema transforms
-use super::ReaderFeature;
+use super::TableFeature;
 use crate::actions::Protocol;
-use crate::schema::{ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField};
+use crate::schema::{
+    ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField, StructType,
+};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
@@ -36,7 +38,7 @@ pub(crate) fn column_mapping_mode(
         // (but should be ignored) even when the feature is not supported. For details see
         // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
         (Some(mode), 2) => mode,
-        (Some(mode), 3) if protocol.has_reader_feature(&ReaderFeature::ColumnMapping) => mode,
+        (Some(mode), 3) if protocol.has_table_feature(&TableFeature::ColumnMapping) => mode,
         _ => ColumnMappingMode::None,
     }
 }
@@ -44,11 +46,6 @@ pub(crate) fn column_mapping_mode(
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
 /// physical name and field_id; when not enabled, verify that no fields are annotated.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
-    if mode == ColumnMappingMode::Id {
-        // TODO: Support column mapping ID mode
-        return Err(Error::unsupported("Column mapping ID mode not supported"));
-    }
-
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
@@ -155,6 +152,12 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
         }
         None
     }
+    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+        // don't recurse into variant's fields, as they are not expected to have column mapping
+        // annotations
+        // TODO: this changes with icebergcompat right? see issue#1125 for icebergcompat.
+        None
+    }
 }
 
 #[cfg(test)]
@@ -201,8 +204,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::ColumnMapping]),
-            empty_features.clone(),
+            Some([TableFeature::ColumnMapping]),
+            Some([TableFeature::ColumnMapping]),
         )
         .unwrap();
 
@@ -219,8 +222,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
-            empty_features.clone(),
+            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
 
@@ -237,8 +240,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors, ReaderFeature::ColumnMapping]),
-            empty_features,
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
         )
         .unwrap();
 
@@ -301,45 +304,40 @@ mod tests {
             create_annotations(inner_id, inner_name),
             create_annotations(outer_id, outer_name)
         );
-        println!("{}", schema);
-        StructType::new([serde_json::from_str(&schema).unwrap()])
+        println!("{schema}");
+        StructType::new_unchecked([serde_json::from_str(&schema).unwrap()])
     }
 
     #[test]
     fn test_column_mapping_enabled() {
-        let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name).unwrap();
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Id).expect_err("not supported");
+        [ColumnMappingMode::Name, ColumnMappingMode::Id]
+            .into_iter()
+            .for_each(|mode| {
+                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).unwrap();
 
-        // missing annotation
-        let schema = create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("missing field id");
-        let schema = create_schema("5", None, "4", "\"col-5f422f40\"");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("missing field name");
-        let schema = create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("missing field id");
-        let schema = create_schema("5", "\"col-a7f4159c\"", "4", None);
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("missing field name");
+                // missing annotation
+                let schema = create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
+                let schema = create_schema("5", None, "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
+                let schema = create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
+                let schema = create_schema("5", "\"col-a7f4159c\"", "4", None);
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
 
-        // wrong-type field id annotation (string instead of int)
-        let schema = create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("invalid field id");
-        let schema = create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("invalid field id");
+                // wrong-type field id annotation (string instead of int)
+                let schema = create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
+                let schema = create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
 
-        // wrong-type field name annotation (int instead of string)
-        let schema = create_schema("5", "555", "4", "\"col-5f422f40\"");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("invalid field name");
-        let schema = create_schema("5", "\"col-a7f4159c\"", "4", "444");
-        validate_schema_column_mapping(&schema, ColumnMappingMode::Name)
-            .expect_err("invalid field name");
+                // wrong-type field name annotation (int instead of string)
+                let schema = create_schema("5", "555", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
+                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "444");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
+            });
     }
 
     #[test]

@@ -2,77 +2,92 @@ use delta_kernel::{DeltaResult, Error};
 
 use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
+// We explicitly assign integer values to the error codes here because C and Rust are inconsistent
+// about values for "typedefed" features. Rust reserves the numbers for them regardless, so
+// `EngineDataTypeError` will be `3` whether or not `default-engine-base` is on becasue `ArrowError`
+// _always_ is `2`. But in the C header we get:
+
+// #if defined(DEFINE_DEFAULT_ENGINE_BASE)
+// ArrowError,
+// #endif
+
+// and C will _NOT_ count that if `DEFINE_DEFAULT_ENGINE_BASE` isn't defined, so
+// `EngineDataTypeError` will end up as `2`, and everything is confused.  By manually specifying the
+// values we avoid this issue.
+
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum KernelError {
-    UnknownError, // catch-all for unrecognized kernel Error types
-    FFIError,     // errors encountered in the code layer that supports FFI
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-    ArrowError,
-    EngineDataTypeError,
-    ExtractError,
-    GenericError,
-    IOErrorError,
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
-    ParquetError,
-    #[cfg(feature = "default-engine")]
-    ObjectStoreError,
-    #[cfg(feature = "default-engine")]
-    ObjectStorePathError,
-    #[cfg(feature = "default-engine")]
-    ReqwestError,
-    FileNotFoundError,
-    MissingColumnError,
-    UnexpectedColumnTypeError,
-    MissingDataError,
-    MissingVersionError,
-    DeletionVectorError,
-    InvalidUrlError,
-    MalformedJsonError,
-    MissingMetadataError,
-    MissingProtocolError,
-    InvalidProtocolError,
-    MissingMetadataAndProtocolError,
-    ParseError,
-    JoinFailureError,
-    Utf8Error,
-    ParseIntError,
-    InvalidColumnMappingModeError,
-    InvalidTableLocationError,
-    InvalidDecimalError,
-    InvalidStructDataError,
-    InternalError,
-    InvalidExpression,
-    InvalidLogPath,
-    InvalidCommitInfo,
-    FileAlreadyExists,
-    MissingCommitInfo,
-    UnsupportedError,
-    ParseIntervalError,
-    ChangeDataFeedUnsupported,
-    ChangeDataFeedIncompatibleSchema,
-    InvalidCheckpoint,
-    LiteralExpressionTransformError,
+    UnknownError = 0, // catch-all for unrecognized kernel Error types
+    FFIError = 1,     // errors encountered in the code layer that supports FFI
+    #[cfg(feature = "default-engine-base")]
+    ArrowError = 2,
+    EngineDataTypeError = 3,
+    ExtractError = 4,
+    GenericError = 5,
+    IOErrorError = 6,
+    #[cfg(feature = "default-engine-base")]
+    ParquetError = 7,
+    #[cfg(feature = "default-engine-base")]
+    ObjectStoreError = 8,
+    #[cfg(feature = "default-engine-base")]
+    ObjectStorePathError = 9,
+    #[cfg(feature = "default-engine-base")]
+    ReqwestError = 10,
+    FileNotFoundError = 11,
+    MissingColumnError = 12,
+    UnexpectedColumnTypeError = 13,
+    MissingDataError = 14,
+    MissingVersionError = 15,
+    DeletionVectorError = 16,
+    InvalidUrlError = 17,
+    MalformedJsonError = 18,
+    MissingMetadataError = 19,
+    MissingProtocolError = 20,
+    InvalidProtocolError = 21,
+    MissingMetadataAndProtocolError = 22,
+    ParseError = 23,
+    JoinFailureError = 24,
+    Utf8Error = 25,
+    ParseIntError = 26,
+    InvalidColumnMappingModeError = 27,
+    InvalidTableLocationError = 28,
+    InvalidDecimalError = 29,
+    InvalidStructDataError = 30,
+    InternalError = 31,
+    InvalidExpression = 32,
+    InvalidLogPath = 33,
+    FileAlreadyExists = 34,
+    UnsupportedError = 35,
+    ParseIntervalError = 36,
+    ChangeDataFeedUnsupported = 37,
+    ChangeDataFeedIncompatibleSchema = 38,
+    InvalidCheckpoint = 39,
+    LiteralExpressionTransformError = 40,
+    CheckpointWriteError = 41,
+    SchemaError = 42,
 }
 
 impl From<Error> for KernelError {
     fn from(e: Error) -> Self {
         match e {
             // NOTE: By definition, no kernel Error maps to FFIError
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+            #[cfg(feature = "default-engine-base")]
             Error::Arrow(_) => KernelError::ArrowError,
+            Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
             Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+            #[cfg(feature = "default-engine-base")]
             Error::Parquet(_) => KernelError::ParquetError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::Reqwest(_) => KernelError::ReqwestError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
@@ -101,9 +116,7 @@ impl From<Error> for KernelError {
             } => Self::from(*source),
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
             Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
-            Error::InvalidCommitInfo(_) => KernelError::InvalidCommitInfo,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
-            Error::MissingCommitInfo => KernelError::MissingCommitInfo,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
             Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
@@ -114,6 +127,8 @@ impl From<Error> for KernelError {
             Error::LiteralExpressionTransformError(_) => {
                 KernelError::LiteralExpressionTransformError
             }
+            Error::Schema(_) => KernelError::SchemaError,
+            _ => KernelError::UnknownError,
         }
     }
 }
@@ -178,7 +193,9 @@ impl AllocateError for AllocateErrorFn {
     }
 }
 
-impl AllocateError for &dyn ExternEngine {
+// We do this instead of `impl AllocateError for &dyn ExternEngine` since we can then directly use
+// this trait on type T instead of having to cast it to a trait object first.
+impl<T: ExternEngine + ?Sized> AllocateError for &T {
     /// # Safety
     ///
     /// In addition to the usual requirements, the engine handle must be valid.
@@ -206,7 +223,7 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
                 ExternResult::Err(err)
             }

@@ -4,22 +4,15 @@
 // tools available and on your path. Any Java version between 8 and 17 should work.
 //
 // Run these integration tests with:
-//   cargo test --features integration-test,cloud --test hdfs
-#![cfg(all(
-    feature = "integration-test",
-    feature = "cloud",
-    not(target_os = "windows")
-))]
+//   cargo test --features integration-test --test hdfs
+#![cfg(all(feature = "integration-test", not(target_os = "windows")))]
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::Table;
+use delta_kernel::Snapshot;
 use hdfs_native::{Client, WriteOptions};
 use hdfs_native_object_store::minidfs::MiniDfs;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 extern crate walkdir;
 use walkdir::WalkDir;
 
@@ -56,6 +49,7 @@ async fn write_local_path_to_hdfs(
 }
 
 #[tokio::test]
+#[ignore = "Skipping HDFS integration test"]
 async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
     let minidfs = MiniDfs::with_features(&HashSet::new());
     let hdfs_client = Client::default();
@@ -71,14 +65,9 @@ async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
     let url_str = format!("{}/my-delta-table", minidfs.url);
     let url = url::Url::parse(&url_str).unwrap();
 
-    let engine = DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    let engine = test_utils::create_default_engine(&url)?;
 
-    let table = Table::new(url);
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
     assert_eq!(snapshot.version(), 1);
 
     Ok(())

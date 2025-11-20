@@ -28,14 +28,10 @@ enum OpType {
   Divide,
   Multiply,
   LessThan,
-  LessThanOrEqual,
   GreaterThan,
-  GreaterThaneOrEqual,
   Equal,
-  NotEqual,
   Distinct,
   In,
-  NotIn,
 };
 enum LitType {
   Integer,
@@ -53,9 +49,21 @@ enum LitType {
   Decimal,
   Null,
   Struct,
-  Array
+  Array,
+  Map
 };
-enum ExpressionType { BinOp, Variadic, Literal, Unary, Column };
+enum ExpressionType {
+  BinOp,
+  Variadic,
+  Literal,
+  Unary,
+  Column,
+  Transform,
+  FieldTransform,
+  OpaqueExpression,
+  OpaquePredicate,
+  Unknown,
+};
 enum VariadicType {
   And,
   Or,
@@ -82,6 +90,26 @@ struct Unary {
   enum UnaryType type;
   ExpressionItemList sub_expr;
 };
+struct TransformExpression {
+  ExpressionItemList input_path;
+  ExpressionItemList field_transforms;
+};
+struct FieldTransform {
+  char* field_name;
+  ExpressionItemList exprs;
+  bool is_replace;
+};
+struct OpaqueExpression {
+  HandleSharedOpaqueExpressionOp op;
+  ExpressionItemList exprs;
+};
+struct OpaquePredicate {
+  HandleSharedOpaquePredicateOp op;
+  ExpressionItemList exprs;
+};
+struct Unknown {
+  char* name;
+};
 struct BinaryData {
   uint8_t* buf;
   uintptr_t len;
@@ -103,6 +131,10 @@ struct Struct {
 struct ArrayData {
   ExpressionItemList exprs;
 };
+struct MapData {
+  ExpressionItemList keys;
+  ExpressionItemList vals;
+};
 struct Literal {
   enum LitType type;
   union LiteralValue {
@@ -116,6 +148,7 @@ struct Literal {
     char* string_data;
     struct Struct struct_data;
     struct ArrayData array_data;
+    struct MapData map_data;
     struct BinaryData binary;
     struct Decimal decimal;
   } value;
@@ -161,14 +194,10 @@ DEFINE_BINOP(visit_expr_minus, Minus)
 DEFINE_BINOP(visit_expr_multiply, Multiply)
 DEFINE_BINOP(visit_expr_divide, Divide)
 DEFINE_BINOP(visit_expr_lt, LessThan)
-DEFINE_BINOP(visit_expr_le, LessThanOrEqual)
 DEFINE_BINOP(visit_expr_gt, GreaterThan)
-DEFINE_BINOP(visit_expr_ge, GreaterThaneOrEqual)
 DEFINE_BINOP(visit_expr_eq, Equal)
-DEFINE_BINOP(visit_expr_ne, NotEqual)
 DEFINE_BINOP(visit_expr_distinct, Distinct)
 DEFINE_BINOP(visit_expr_in, In)
-DEFINE_BINOP(visit_expr_not_in, NotIn)
 #undef DEFINE_BINOP
 
 /*************************************************************
@@ -267,11 +296,110 @@ DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 #undef DEFINE_VARIADIC
 
+// Sort by field name, breaking ties by pointer address to ensure stability.
+int transform_op_cmp(const void* a, const void* b) {
+  const struct FieldTransform* op_a = ((ExpressionItem*)a)->ref;
+  const struct FieldTransform* op_b = ((ExpressionItem*)b)->ref;
+  if (op_a->field_name == NULL && op_b->field_name == NULL) {
+    // break tie below
+  } else if (op_a->field_name == NULL) {
+    return -1;
+  } else if (op_b->field_name == NULL) {
+    return 1;
+  } else {
+    int cmp = strcmp(op_a->field_name, op_b->field_name);
+    if (cmp != 0) {
+      return cmp;
+    } // else break tie below
+  }
+  if (op_a < op_b) {
+    return -1;
+  } else if (op_a > op_b) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+void visit_transform_expr(
+    void* data,
+    uintptr_t sibling_list_id,
+    uintptr_t input_path_list_id,
+    uintptr_t child_list_id)
+{
+  struct TransformExpression* transform = malloc(sizeof(struct TransformExpression));
+  transform->input_path = get_expr_list(data, input_path_list_id);
+  transform->field_transforms = get_expr_list(data, child_list_id);
+
+  // stable sort the ops by field name to ensure deterministic output
+  qsort(
+      transform->field_transforms.list,
+      transform->field_transforms.len,
+      sizeof(ExpressionItem),
+      transform_op_cmp);
+
+  put_expr_item(data, sibling_list_id, transform, Transform);
+}
+void visit_field_transform(
+    void* data,
+    uintptr_t sibling_list_id,
+    const KernelStringSlice* field_name,
+    uintptr_t child_list_id,
+    bool is_replace)
+{
+  struct FieldTransform* field_transform = malloc(sizeof(struct FieldTransform));
+  field_transform->field_name = field_name? allocate_string(*field_name) : NULL;
+  field_transform->exprs = get_expr_list(data, child_list_id);
+  field_transform->is_replace = is_replace;
+  put_expr_item(data, sibling_list_id, field_transform, FieldTransform);
+}
+void visit_opaque_expr(
+    void *data,
+    uintptr_t sibling_list_id,
+    HandleSharedOpaqueExpressionOp op,
+    uintptr_t child_list_id)
+{
+  struct OpaqueExpression* opaque = malloc(sizeof(struct OpaqueExpression));
+  opaque->op = op;
+  opaque->exprs = get_expr_list(data, child_list_id);
+  put_expr_item(data, sibling_list_id, opaque, OpaqueExpression);
+}
+
+void visit_opaque_pred(
+    void *data,
+    uintptr_t sibling_list_id,
+    HandleSharedOpaquePredicateOp op,
+    uintptr_t child_list_id)
+{
+  struct OpaquePredicate* opaque = malloc(sizeof(struct OpaquePredicate));
+  opaque->op = op;
+  opaque->exprs = get_expr_list(data, child_list_id);
+  put_expr_item(data, sibling_list_id, opaque, OpaquePredicate);
+}
+
+void visit_unknown(void *data, uintptr_t sibling_list_id, struct KernelStringSlice name) {
+  struct Unknown* unknown = malloc(sizeof(struct Unknown));
+  unknown->name = allocate_string(name);
+  put_expr_item(data, sibling_list_id, unknown, Unknown);
+}
+
 void visit_expr_array_literal(void* data, uintptr_t sibling_list_id, uintptr_t child_list_id) {
   struct Literal* literal = malloc(sizeof(struct Literal));
   literal->type = Array;
   struct ArrayData* arr = &(literal->value.array_data);
   arr->exprs = get_expr_list(data, child_list_id);
+  put_expr_item(data, sibling_list_id, literal, Literal);
+}
+
+void visit_expr_map_literal(void* data,
+                            uintptr_t sibling_list_id,
+                            uintptr_t key_list_id,
+                            uintptr_t value_list_id) {
+  struct Literal* literal = malloc(sizeof(struct Literal));
+  literal->type = Map;
+  struct MapData* map = &(literal->value.map_data);
+  map->keys = get_expr_list(data, key_list_id);
+  map->vals = get_expr_list(data, value_list_id);
   put_expr_item(data, sibling_list_id, literal, Literal);
 }
 
@@ -312,13 +440,64 @@ uintptr_t make_field_list(void* data, uintptr_t reserve) {
   int id = builder->list_count;
   builder->list_count++;
   builder->lists = realloc(builder->lists, sizeof(ExpressionItemList) * builder->list_count);
-  ExpressionItem* list = calloc(reserve, sizeof(ExpressionItem));
+  ExpressionItem* list = reserve? calloc(reserve, sizeof(ExpressionItem)) : NULL;
   builder->lists[id].len = 0;
   builder->lists[id].list = list;
   return id;
 }
 
-ExpressionItemList construct_predicate(SharedExpression* predicate) {
+ExpressionItemList construct_expression(SharedExpression* expression) {
+  ExpressionBuilder data = { 0 };
+  make_field_list(&data, 0); // list id 0 is the invalid/missing/empty list
+
+  EngineExpressionVisitor visitor = {
+    .data = &data,
+    .make_field_list = make_field_list,
+    .visit_literal_int = visit_expr_int_literal,
+    .visit_literal_long = visit_expr_long_literal,
+    .visit_literal_short = visit_expr_short_literal,
+    .visit_literal_byte = visit_expr_byte_literal,
+    .visit_literal_float = visit_expr_float_literal,
+    .visit_literal_double = visit_expr_double_literal,
+    .visit_literal_bool = visit_expr_boolean_literal,
+    .visit_literal_timestamp = visit_expr_timestamp_literal,
+    .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
+    .visit_literal_date = visit_expr_date_literal,
+    .visit_literal_binary = visit_expr_binary_literal,
+    .visit_literal_null = visit_expr_null_literal,
+    .visit_literal_decimal = visit_expr_decimal_literal,
+    .visit_literal_string = visit_expr_string_literal,
+    .visit_literal_struct = visit_expr_struct_literal,
+    .visit_literal_array = visit_expr_array_literal,
+    .visit_literal_map = visit_expr_map_literal,
+    .visit_and = visit_expr_and,
+    .visit_or = visit_expr_or,
+    .visit_not = visit_expr_not,
+    .visit_is_null = visit_expr_is_null,
+    .visit_lt = visit_expr_lt,
+    .visit_gt = visit_expr_gt,
+    .visit_eq = visit_expr_eq,
+    .visit_distinct = visit_expr_distinct,
+    .visit_in = visit_expr_in,
+    .visit_add = visit_expr_add,
+    .visit_minus = visit_expr_minus,
+    .visit_multiply = visit_expr_multiply,
+    .visit_divide = visit_expr_divide,
+    .visit_column = visit_expr_column,
+    .visit_struct_expr = visit_expr_struct_expr,
+    .visit_transform_expr = visit_transform_expr,
+    .visit_field_transform = visit_field_transform,
+    .visit_opaque_pred = visit_opaque_pred,
+    .visit_opaque_expr = visit_opaque_expr,
+    .visit_unknown = visit_unknown,
+  };
+  uintptr_t top_level_id = visit_expression(&expression, &visitor);
+  ExpressionItemList top_level_expr = data.lists[top_level_id];
+  free(data.lists);
+  return top_level_expr;
+}
+
+ExpressionItemList construct_predicate(SharedPredicate* predicate) {
   ExpressionBuilder data = { 0 };
   EngineExpressionVisitor visitor = {
     .data = &data,
@@ -344,22 +523,21 @@ ExpressionItemList construct_predicate(SharedExpression* predicate) {
     .visit_not = visit_expr_not,
     .visit_is_null = visit_expr_is_null,
     .visit_lt = visit_expr_lt,
-    .visit_le = visit_expr_le,
     .visit_gt = visit_expr_gt,
-    .visit_ge = visit_expr_ge,
     .visit_eq = visit_expr_eq,
-    .visit_ne = visit_expr_ne,
     .visit_distinct = visit_expr_distinct,
     .visit_in = visit_expr_in,
-    .visit_not_in = visit_expr_not_in,
     .visit_add = visit_expr_add,
     .visit_minus = visit_expr_minus,
     .visit_multiply = visit_expr_multiply,
     .visit_divide = visit_expr_divide,
     .visit_column = visit_expr_column,
     .visit_struct_expr = visit_expr_struct_expr,
+    .visit_opaque_pred = visit_opaque_pred,
+    .visit_opaque_expr = visit_opaque_expr,
+    .visit_unknown = visit_unknown,
   };
-  uintptr_t top_level_id = visit_expression(&predicate, &visitor);
+  uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
   free(data.lists);
   return top_level_expr;
@@ -380,6 +558,40 @@ void free_expression_item(ExpressionItem ref) {
       free(var);
       break;
     };
+    case Transform: {
+      struct TransformExpression* transform = ref.ref;
+      free_expression_list(transform->input_path);
+      free_expression_list(transform->field_transforms);
+      free(transform);
+      break;
+    }
+    case FieldTransform: {
+      struct FieldTransform* field_transform = ref.ref;
+      free(field_transform->field_name);
+      free_expression_list(field_transform->exprs);
+      free(field_transform);
+      break;
+    }
+    case OpaqueExpression: {
+      struct OpaqueExpression* opaque = ref.ref;
+      free_kernel_opaque_expression_op(opaque->op);
+      free_expression_list(opaque->exprs);
+      free(opaque);
+      break;
+    };
+    case OpaquePredicate: {
+      struct OpaquePredicate* opaque = ref.ref;
+      free_kernel_opaque_predicate_op(opaque->op);
+      free_expression_list(opaque->exprs);
+      free(opaque);
+      break;
+    };
+    case Unknown: {
+      struct Unknown* unknown = ref.ref;
+      free(unknown->name);
+      free(unknown);
+      break;
+    };
     case Literal: {
       struct Literal* lit = ref.ref;
       switch (lit->type) {
@@ -392,6 +604,12 @@ void free_expression_item(ExpressionItem ref) {
         case Array: {
           struct ArrayData* array = &lit->value.array_data;
           free_expression_list(array->exprs);
+          break;
+        }
+        case Map: {
+          struct MapData* map = &lit->value.map_data;
+          free_expression_list(map->keys);
+          free_expression_list(map->vals);
           break;
         }
         case String: {

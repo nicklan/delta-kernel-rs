@@ -1,31 +1,30 @@
-//! Provides engine implementation that implement the required traits. These engines can optionally
-//! be built into the kernel by setting the `default-engine` or `sync-engine` feature flags. See the
-//! related modules for more information.
+//! Provides an engine implementation that implements the required traits. The engine can optionally
+//! be built into the kernel by setting the `default-engine` feature flag. See the related module
+//! for more information.
 
 #[cfg(feature = "arrow-conversion")]
-pub(crate) mod arrow_conversion;
+pub mod arrow_conversion;
 
-#[cfg(all(
-    feature = "arrow-expression",
-    any(feature = "default-engine-base", feature = "sync-engine")
-))]
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
 #[cfg(feature = "arrow-expression")]
 pub(crate) mod arrow_utils;
+#[cfg(feature = "internal-api")]
+pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
 
-#[cfg(feature = "sync-engine")]
-pub mod sync;
+#[cfg(test)]
+pub(crate) mod sync;
 
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub mod arrow_data;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub(crate) mod arrow_get_data;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub(crate) mod ensure_data_types;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
@@ -38,6 +37,7 @@ mod tests {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine_data::FilteredEngineData;
     use crate::{Engine, EngineData};
 
     use test_utils::delta_path_for_version;
@@ -48,7 +48,11 @@ mod tests {
         engine_data: impl Fn() -> Box<dyn EngineData>,
     ) {
         let json = engine.json_handler();
-        let get_data = || Box::new(std::iter::once(Ok(engine_data())));
+        let get_data = || {
+            let data = engine_data();
+            let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+            Box::new(std::iter::once(Ok(filtered_data)))
+        };
 
         let expected_names: Vec<Path> = (1..4)
             .map(|i| delta_path_for_version(i, "json"))

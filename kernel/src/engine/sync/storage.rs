@@ -14,9 +14,9 @@ impl StorageHandler for SyncStorageHandler {
         url_path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
         if url_path.scheme() == "file" {
-            let path = url_path.to_file_path().map_err(|_| {
-                Error::Generic(format!("Invalid path for list_from: {:?}", url_path))
-            })?;
+            let path = url_path
+                .to_file_path()
+                .map_err(|_| Error::Generic(format!("Invalid path for list_from: {url_path:?}")))?;
 
             let (path_to_read, min_file_name) = if path.is_dir() {
                 // passed path is an existing dir, don't strip anything and don't filter the results
@@ -26,12 +26,10 @@ impl StorageHandler for SyncStorageHandler {
                 // that and use it as the min_file_name to return
                 let parent = path
                     .parent()
-                    .ok_or_else(|| {
-                        Error::Generic(format!("Invalid path for list_from: {:?}", path))
-                    })?
+                    .ok_or_else(|| Error::Generic(format!("Invalid path for list_from: {path:?}")))?
                     .to_path_buf();
                 let file_name = path.file_name().ok_or_else(|| {
-                    Error::Generic(format!("Invalid path for list_from: {:?}", path))
+                    Error::Generic(format!("Invalid path for list_from: {path:?}"))
                 })?;
                 (parent, Some(file_name))
             };
@@ -72,21 +70,28 @@ impl StorageHandler for SyncStorageHandler {
         });
         Ok(Box::new(iter))
     }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        unimplemented!("SyncStorageHandler does not implement copy");
+    }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        unimplemented!("head is not implemented for SyncStorageHandler")
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::Write;
-    use std::time::{Duration, SystemTime};
-    use std::{fs::File, time::UNIX_EPOCH};
+    use std::time::Duration;
 
     use bytes::{BufMut, BytesMut};
     use itertools::Itertools;
     use url::Url;
 
-    use test_utils::abs_diff;
-
     use super::SyncStorageHandler;
+    use crate::utils::current_time_duration;
     use crate::StorageHandler;
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
@@ -99,7 +104,7 @@ mod tests {
         let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
 
-        let begin_time = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let begin_time = current_time_duration()?;
 
         let path = tmp_dir.path().join(get_json_filename(1));
         let mut f = File::create(path)?;
@@ -113,7 +118,7 @@ mod tests {
         assert!(!files.is_empty());
         for meta in files.iter() {
             let meta_time = Duration::from_millis(meta.last_modified.try_into()?);
-            assert!(abs_diff(meta_time, begin_time) < Duration::from_secs(10));
+            assert!(meta_time.abs_diff(begin_time) < Duration::from_secs(10));
         }
         Ok(())
     }

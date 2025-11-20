@@ -191,6 +191,15 @@ pub struct EngineSchemaVisitor {
         is_nullable: bool,
         metadata: &CStringMap,
     ),
+
+    /// Visit a `variant` belonging to the list identified by `sibling_list_id`.
+    pub visit_variant: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CStringMap,
+    ),
 }
 
 /// Visit the given `schema` using the provided `visitor`. See the documentation of
@@ -213,7 +222,7 @@ pub unsafe extern "C" fn visit_schema(
 fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> usize {
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
-        let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
+        let child_list_id = (visitor.make_field_list)(visitor.data, s.num_fields());
         for field in s.fields() {
             visit_schema_item(
                 field.name(),
@@ -303,9 +312,10 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             DataType::Array(at) => {
                 call!(visit_array, visit_array_item(visitor, at, at.contains_null))
             }
-            DataType::Primitive(PrimitiveType::Decimal(precision, scale)) => {
-                call!(visit_decimal, *precision, *scale)
+            DataType::Primitive(PrimitiveType::Decimal(d)) => {
+                call!(visit_decimal, d.precision(), d.scale())
             }
+            &DataType::Variant(_) => call!(visit_variant),
             &DataType::STRING => call!(visit_string),
             &DataType::LONG => call!(visit_long),
             &DataType::INTEGER => call!(visit_integer),

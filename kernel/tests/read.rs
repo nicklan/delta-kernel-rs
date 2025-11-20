@@ -1,33 +1,38 @@
 use std::collections::HashMap;
-use std::ops::Not;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
+use delta_kernel::arrow::array::AsArray as _;
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::expressions::{column_expr, BinaryOperator, Expression, ExpressionRef};
+use delta_kernel::expressions::{
+    column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
+};
+use delta_kernel::log_segment::LogSegment;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
-use delta_kernel::scan::state::{transform_to_logical, visit_scan_files, DvInfo, Stats};
+use delta_kernel::path::ParsedLogPath;
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::{DataType, Schema};
-use delta_kernel::{Engine, FileMeta, Table};
+use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
+use delta_kernel::{Engine, FileMeta, Snapshot};
+
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
-    record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,
+    load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, to_arrow,
+    IntoArray, TestAction, METADATA,
 };
 use url::Url;
 
 mod common;
-use common::{read_scan, to_arrow};
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
+const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
 
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,24 +62,19 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
 
-    let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(engine)?.zip(expected_data);
 
     for (data, expected) in stream {
-        let raw_data = data?.raw_data?;
         files += 1;
-        assert_eq!(into_record_batch(raw_data), expected);
+        assert_eq!(into_record_batch(data?), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
     Ok(())
@@ -113,21 +113,19 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(storage.clone());
 
-    let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&engine, None).unwrap();
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
 
     for (data, expected) in stream {
-        let raw_data = data?.raw_data?;
         files += 1;
-        assert_eq!(into_record_batch(raw_data), expected);
+        assert_eq!(into_record_batch(data?), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
 
@@ -167,21 +165,19 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(storage.clone());
 
-    let table = Table::new(location);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(&engine, None)?;
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let scan = snapshot.scan_builder().build()?;
 
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
-        let raw_data = data?.raw_data?;
         files += 1;
-        assert_eq!(into_record_batch(raw_data), expected);
+        assert_eq!(into_record_batch(data?), expected);
     }
     assert_eq!(1, files, "Expected to have scanned one file");
     Ok(())
@@ -239,56 +235,49 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
-
-    let table = Table::new(location);
-    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
     //
     // NOTE: For cases that match both batch1 and batch2, we list batch2 first because log replay
     // returns most recently added files first.
-    use BinaryOperator::{
-        Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
-    };
-    let test_cases: Vec<(_, i32, _)> = vec![
-        (Equal, 0, vec![]),
-        (Equal, 1, vec![&batch1]),
-        (Equal, 3, vec![&batch1]),
-        (Equal, 4, vec![]),
-        (Equal, 5, vec![&batch2]),
-        (Equal, 7, vec![&batch2]),
-        (Equal, 8, vec![]),
-        (LessThan, 1, vec![]),
-        (LessThan, 2, vec![&batch1]),
-        (LessThan, 5, vec![&batch1]),
-        (LessThan, 6, vec![&batch2, &batch1]),
-        (LessThanOrEqual, 0, vec![]),
-        (LessThanOrEqual, 1, vec![&batch1]),
-        (LessThanOrEqual, 4, vec![&batch1]),
-        (LessThanOrEqual, 5, vec![&batch2, &batch1]),
-        (GreaterThan, 2, vec![&batch2, &batch1]),
-        (GreaterThan, 3, vec![&batch2]),
-        (GreaterThan, 6, vec![&batch2]),
-        (GreaterThan, 7, vec![]),
-        (GreaterThanOrEqual, 3, vec![&batch2, &batch1]),
-        (GreaterThanOrEqual, 4, vec![&batch2]),
-        (GreaterThanOrEqual, 7, vec![&batch2]),
-        (GreaterThanOrEqual, 8, vec![]),
-        (NotEqual, 0, vec![&batch2, &batch1]),
-        (NotEqual, 1, vec![&batch2, &batch1]),
-        (NotEqual, 3, vec![&batch2, &batch1]),
-        (NotEqual, 4, vec![&batch2, &batch1]),
-        (NotEqual, 5, vec![&batch2, &batch1]),
-        (NotEqual, 7, vec![&batch2, &batch1]),
-        (NotEqual, 8, vec![&batch2, &batch1]),
+    #[allow(clippy::type_complexity)] // otherwise it's even more complex because no `_`
+    let test_cases: Vec<(fn(Expr, Expr) -> _, _, _)> = vec![
+        (Pred::eq, 0i32, vec![]),
+        (Pred::eq, 1, vec![&batch1]),
+        (Pred::eq, 3, vec![&batch1]),
+        (Pred::eq, 4, vec![]),
+        (Pred::eq, 5, vec![&batch2]),
+        (Pred::eq, 7, vec![&batch2]),
+        (Pred::eq, 8, vec![]),
+        (Pred::lt, 1, vec![]),
+        (Pred::lt, 2, vec![&batch1]),
+        (Pred::lt, 5, vec![&batch1]),
+        (Pred::lt, 6, vec![&batch2, &batch1]),
+        (Pred::le, 0, vec![]),
+        (Pred::le, 1, vec![&batch1]),
+        (Pred::le, 4, vec![&batch1]),
+        (Pred::le, 5, vec![&batch2, &batch1]),
+        (Pred::gt, 2, vec![&batch2, &batch1]),
+        (Pred::gt, 3, vec![&batch2]),
+        (Pred::gt, 6, vec![&batch2]),
+        (Pred::gt, 7, vec![]),
+        (Pred::ge, 3, vec![&batch2, &batch1]),
+        (Pred::ge, 4, vec![&batch2]),
+        (Pred::ge, 7, vec![&batch2]),
+        (Pred::ge, 8, vec![]),
+        (Pred::ne, 0, vec![&batch2, &batch1]),
+        (Pred::ne, 1, vec![&batch2, &batch1]),
+        (Pred::ne, 3, vec![&batch2, &batch1]),
+        (Pred::ne, 4, vec![&batch2, &batch1]),
+        (Pred::ne, 5, vec![&batch2, &batch1]),
+        (Pred::ne, 7, vec![&batch2, &batch1]),
+        (Pred::ne, 8, vec![&batch2, &batch1]),
     ];
-    for (op, value, expected_batches) in test_cases {
-        let predicate = Expression::binary(op, column_expr!("id"), value);
+    for (pred_fn, value, expected_batches) in test_cases {
+        let predicate = pred_fn(column_expr!("id"), Expr::literal(value));
         let scan = snapshot
             .clone()
             .scan_builder()
@@ -300,9 +289,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         let stream = scan.execute(engine.clone())?.zip(expected_batches);
 
         for (batch, expected) in stream {
-            let raw_data = batch?.raw_data?;
             files_scanned += 1;
-            assert_eq!(into_record_batch(raw_data), expected.clone());
+            assert_eq!(into_record_batch(batch?), expected.clone());
         }
         assert_eq!(expected_files, files_scanned, "{predicate:?}");
     }
@@ -314,7 +302,9 @@ fn read_with_execute(
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
+    let result_schema = Arc::new(ArrowSchema::try_from_kernel(
+        scan.logical_schema().as_ref(),
+    )?);
     let batches = read_scan(scan, engine)?;
 
     if expected.is_empty() {
@@ -333,7 +323,7 @@ struct ScanFile {
     transform: Option<ExpressionRef>,
 }
 
-fn scan_data_callback(
+fn scan_metadata_callback(
     batches: &mut Vec<ScanFile>,
     path: &str,
     size: i64,
@@ -350,25 +340,20 @@ fn scan_data_callback(
     });
 }
 
-fn read_with_scan_data(
+fn read_with_scan_metadata(
     location: &Url,
     engine: &dyn Engine,
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let global_state = scan.global_scan_state();
-    let result_schema: ArrowSchemaRef = Arc::new(scan.schema().as_ref().try_into()?);
-    let scan_data = scan.scan_data(engine)?;
+    let result_schema = Arc::new(ArrowSchema::try_from_kernel(
+        scan.logical_schema().as_ref(),
+    )?);
+    let scan_metadata = scan.scan_metadata(engine)?;
     let mut scan_files = vec![];
-    for data in scan_data {
-        let (data, vec, transforms) = data?;
-        scan_files = visit_scan_files(
-            data.as_ref(),
-            &vec,
-            &transforms,
-            scan_files,
-            scan_data_callback,
-        )?;
+    for res in scan_metadata {
+        let scan_metadata = res?;
+        scan_files = scan_metadata.visit_scan_files(scan_files, scan_metadata_callback)?;
     }
 
     let mut batches = vec![];
@@ -380,14 +365,14 @@ fn read_with_scan_data(
             .unwrap();
         let meta = FileMeta {
             last_modified: 0,
-            size: scan_file.size as usize,
+            size: scan_file.size.try_into().unwrap(),
             location: file_path,
         };
         let read_results = engine
             .parquet_handler()
             .read_parquet_files(
                 &[meta],
-                global_state.physical_schema.clone(),
+                scan.physical_schema().clone(),
                 scan.physical_predicate().clone(),
             )
             .unwrap();
@@ -399,9 +384,9 @@ fn read_with_scan_data(
             let logical = transform_to_logical(
                 engine,
                 read_result,
-                &global_state.physical_schema,
-                &global_state.logical_schema,
-                &scan_file.transform,
+                scan.physical_schema(),
+                scan.logical_schema(),
+                scan_file.transform.clone(),
             )
             .unwrap();
             let record_batch = to_arrow(logical).unwrap();
@@ -429,42 +414,33 @@ fn read_with_scan_data(
 fn read_table_data(
     path: &str,
     select_cols: Option<&[&str]>,
-    predicate: Option<Expression>,
+    predicate: Option<Pred>,
     mut expected: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let predicate = predicate.map(Arc::new);
     let url = url::Url::from_directory_path(path).unwrap();
-    let default_engine = DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
-    let sync_engine = delta_kernel::engine::sync::SyncEngine::new();
+    let engine = test_utils::create_default_engine(&url)?;
 
-    let engines: Vec<Arc<dyn Engine>> = vec![Arc::new(sync_engine), Arc::new(default_engine)];
-    for engine in engines {
-        let table = Table::new(url.clone());
-        let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
 
-        let read_schema = select_cols.map(|select_cols| {
-            let table_schema = snapshot.schema();
-            let selected_fields = select_cols
-                .iter()
-                .map(|col| table_schema.field(col).cloned().unwrap());
-            Arc::new(Schema::new(selected_fields))
-        });
-        println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
-        let scan = snapshot
-            .into_scan_builder()
-            .with_schema_opt(read_schema)
-            .with_predicate(predicate.clone())
-            .build()?;
+    let read_schema = select_cols.map(|select_cols| {
+        let table_schema = snapshot.schema();
+        let selected_fields = select_cols
+            .iter()
+            .map(|col| table_schema.field(col).cloned().unwrap());
+        Arc::new(Schema::new_unchecked(selected_fields))
+    });
+    println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
+    let scan = snapshot
+        .scan_builder()
+        .with_schema_opt(read_schema)
+        .with_predicate(predicate.clone())
+        .build()?;
 
-        sort_lines!(expected);
-        read_with_scan_data(table.location(), engine.as_ref(), &scan, &expected)?;
-        read_with_execute(engine, &scan, &expected)?;
-    }
+    sort_lines!(expected);
+    read_with_scan_metadata(&url, engine.as_ref(), &scan, &expected)?;
+    read_with_execute(engine, &scan, &expected)?;
     Ok(())
 }
 
@@ -472,7 +448,7 @@ fn read_table_data(
 fn read_table_data_str(
     path: &str,
     select_cols: Option<&[&str]>,
-    predicate: Option<Expression>,
+    predicate: Option<Pred>,
     expected: Vec<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     read_table_data(
@@ -591,33 +567,36 @@ fn table_for_letters(letters: &[char]) -> Vec<String> {
 fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
-            column_expr!("number").lt(4i64),
+            column_expr!("number").lt(Expr::literal(4i64)),
             table_for_numbers(vec![1, 2, 3]),
         ),
         (
-            column_expr!("number").le(4i64),
+            column_expr!("number").le(Expr::literal(4i64)),
             table_for_numbers(vec![1, 2, 3, 4]),
         ),
         (
-            column_expr!("number").gt(4i64),
+            column_expr!("number").gt(Expr::literal(4i64)),
             table_for_numbers(vec![5, 6]),
         ),
         (
-            column_expr!("number").ge(4i64),
+            column_expr!("number").ge(Expr::literal(4i64)),
             table_for_numbers(vec![4, 5, 6]),
         ),
-        (column_expr!("number").eq(4i64), table_for_numbers(vec![4])),
         (
-            column_expr!("number").ne(4i64),
+            column_expr!("number").eq(Expr::literal(4i64)),
+            table_for_numbers(vec![4]),
+        ),
+        (
+            column_expr!("number").ne(Expr::literal(4i64)),
             table_for_numbers(vec![1, 2, 3, 5, 6]),
         ),
     ];
 
-    for (expr, expected) in cases.into_iter() {
+    for (pred, expected) in cases.into_iter() {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
-            Some(expr),
+            Some(pred),
             expected,
         )?;
     }
@@ -626,7 +605,7 @@ fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
-    // Test basic column pruning. Note that the actual expression machinery is already well-tested,
+    // Test basic column pruning. Note that the actual predicate machinery is already well-tested,
     // so we're just testing wiring here.
     let null_row_table: Vec<String> = vec![
         "+--------+--------+",
@@ -646,30 +625,36 @@ fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
             table_for_letters(&['a', 'b', 'c', 'e']),
         ),
         (
-            column_expr!("letter").lt("c"),
+            column_expr!("letter").lt(Expr::literal("c")),
             table_for_letters(&['a', 'b']),
         ),
         (
-            column_expr!("letter").le("c"),
+            column_expr!("letter").le(Expr::literal("c")),
             table_for_letters(&['a', 'b', 'c']),
         ),
-        (column_expr!("letter").gt("c"), table_for_letters(&['e'])),
         (
-            column_expr!("letter").ge("c"),
+            column_expr!("letter").gt(Expr::literal("c")),
+            table_for_letters(&['e']),
+        ),
+        (
+            column_expr!("letter").ge(Expr::literal("c")),
             table_for_letters(&['c', 'e']),
         ),
-        (column_expr!("letter").eq("c"), table_for_letters(&['c'])),
         (
-            column_expr!("letter").ne("c"),
+            column_expr!("letter").eq(Expr::literal("c")),
+            table_for_letters(&['c']),
+        ),
+        (
+            column_expr!("letter").ne(Expr::literal("c")),
             table_for_letters(&['a', 'b', 'e']),
         ),
     ];
 
-    for (expr, expected) in cases {
+    for (pred, expected) in cases {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["letter", "number"]),
-            Some(expr),
+            Some(pred),
             expected,
         )?;
     }
@@ -698,38 +683,38 @@ fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
 
     let cases = vec![
         (
-            Expression::or(
+            Pred::or(
                 // No pruning power
-                column_expr!("letter").gt("a"),
-                column_expr!("number").gt(3i64),
+                column_expr!("letter").gt(Expr::literal("a")),
+                column_expr!("number").gt(Expr::literal(3i64)),
             ),
             full_table,
         ),
         (
-            Expression::and(
-                column_expr!("letter").gt("a"),  // numbers 2, 3, 5
-                column_expr!("number").gt(3i64), // letters a, e
+            Pred::and(
+                column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
+                column_expr!("number").gt(Expr::literal(3i64)), // letters a, e
             ),
             table_for_letters(&['e']),
         ),
         (
-            Expression::and(
-                column_expr!("letter").gt("a"), // numbers 2, 3, 5
-                Expression::or(
+            Pred::and(
+                column_expr!("letter").gt(Expr::literal("a")), // numbers 2, 3, 5
+                Pred::or(
                     // No pruning power
-                    column_expr!("letter").eq("c"),
-                    column_expr!("number").eq(3i64),
+                    column_expr!("letter").eq(Expr::literal("c")),
+                    column_expr!("number").eq(Expr::literal(3i64)),
                 ),
             ),
             table_for_letters(&['b', 'c', 'e']),
         ),
     ];
 
-    for (expr, expected) in cases {
+    for (pred, expected) in cases {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["letter", "number"]),
-            Some(expr),
+            Some(pred),
             expected,
         )?;
     }
@@ -740,35 +725,35 @@ fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
 fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
-            Expression::not(column_expr!("number").lt(4i64)),
+            Pred::not(column_expr!("number").lt(Expr::literal(4i64))),
             table_for_numbers(vec![4, 5, 6]),
         ),
         (
-            Expression::not(column_expr!("number").le(4i64)),
+            Pred::not(column_expr!("number").le(Expr::literal(4i64))),
             table_for_numbers(vec![5, 6]),
         ),
         (
-            Expression::not(column_expr!("number").gt(4i64)),
+            Pred::not(column_expr!("number").gt(Expr::literal(4i64))),
             table_for_numbers(vec![1, 2, 3, 4]),
         ),
         (
-            Expression::not(column_expr!("number").ge(4i64)),
+            Pred::not(column_expr!("number").ge(Expr::literal(4i64))),
             table_for_numbers(vec![1, 2, 3]),
         ),
         (
-            Expression::not(column_expr!("number").eq(4i64)),
+            Pred::not(column_expr!("number").eq(Expr::literal(4i64))),
             table_for_numbers(vec![1, 2, 3, 5, 6]),
         ),
         (
-            Expression::not(column_expr!("number").ne(4i64)),
+            Pred::not(column_expr!("number").ne(Expr::literal(4i64))),
             table_for_numbers(vec![4]),
         ),
     ];
-    for (expr, expected) in cases.into_iter() {
+    for (pred, expected) in cases.into_iter() {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
-            Some(expr),
+            Some(pred),
             expected,
         )?;
     }
@@ -788,9 +773,9 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
     read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
-        Some(Expression::and(
+        Some(Pred::and(
             column_expr!("number").is_not_null(),
-            column_expr!("number").lt(Expression::literal(3i64)),
+            column_expr!("number").lt(Expr::literal(3i64)),
         )),
         expected,
     )?;
@@ -867,35 +852,39 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
 fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
-            column_expr!("number")
-                .gt(4i64)
-                .and(column_expr!("a_float").gt(5.5)),
+            Pred::and(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                column_expr!("a_float").gt(Expr::literal(5.5)),
+            ),
             table_for_numbers(vec![6]),
         ),
         (
-            column_expr!("number")
-                .gt(4i64)
-                .and(Expression::not(column_expr!("a_float").gt(5.5))),
+            Pred::and(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+            ),
             table_for_numbers(vec![5]),
         ),
         (
-            column_expr!("number")
-                .gt(4i64)
-                .or(column_expr!("a_float").gt(5.5)),
+            Pred::or(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                column_expr!("a_float").gt(Expr::literal(5.5)),
+            ),
             table_for_numbers(vec![5, 6]),
         ),
         (
-            column_expr!("number")
-                .gt(4i64)
-                .or(Expression::not(column_expr!("a_float").gt(5.5))),
+            Pred::or(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+            ),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
     ];
-    for (expr, expected) in cases.into_iter() {
+    for (pred, expected) in cases.into_iter() {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
-            Some(expr),
+            Some(pred),
             expected,
         )?;
     }
@@ -906,43 +895,39 @@ fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
 fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .and(column_expr!("a_float").gt(5.5)),
-            ),
+            Pred::not(Pred::and(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                column_expr!("a_float").gt(Expr::literal(5.5)),
+            )),
             table_for_numbers(vec![1, 2, 3, 4, 5]),
         ),
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .and(Expression::not(column_expr!("a_float").gt(5.5))),
-            ),
+            Pred::not(Pred::and(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+            )),
             table_for_numbers(vec![1, 2, 3, 4, 6]),
         ),
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .or(column_expr!("a_float").gt(5.5)),
-            ),
+            Pred::not(Pred::or(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                column_expr!("a_float").gt(Expr::literal(5.5)),
+            )),
             table_for_numbers(vec![1, 2, 3, 4]),
         ),
         (
-            Expression::not(
-                column_expr!("number")
-                    .gt(4i64)
-                    .or(Expression::not(column_expr!("a_float").gt(5.5))),
-            ),
+            Pred::not(Pred::or(
+                column_expr!("number").gt(Expr::literal(4i64)),
+                Pred::not(column_expr!("a_float").gt(Expr::literal(5.5))),
+            )),
             vec![],
         ),
     ];
-    for (expr, expected) in cases.into_iter() {
+    for (pred, expected) in cases.into_iter() {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
-            Some(expr),
+            Some(pred),
             expected,
         )?;
     }
@@ -951,37 +936,35 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
-    let empty_struct = Expression::struct_from(vec![]);
+    let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
     let cases = vec![
-        (Expression::literal(false), table_for_numbers(vec![])),
+        (Pred::literal(false), table_for_numbers(vec![])),
         (
-            Expression::and(column_expr!("number"), false),
+            Pred::and(column_pred!("number"), Pred::literal(false)),
             table_for_numbers(vec![]),
         ),
         (
-            Expression::literal(true),
+            Pred::literal(true),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
-            Expression::literal(3i64),
+            Pred::from_expr(Expr::literal(3i64)),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
-            column_expr!("number").distinct(3i64),
+            column_expr!("number").distinct(Expr::literal(3i64)),
             table_for_numbers(vec![1, 2, 4, 5, 6]),
         ),
         (
-            column_expr!("number").distinct(Expression::null_literal(DataType::LONG)),
+            column_expr!("number").distinct(Expr::null_literal(DataType::LONG)),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
-            Expression::not(column_expr!("number").distinct(3i64)),
+            Pred::not(column_expr!("number").distinct(Expr::literal(3i64))),
             table_for_numbers(vec![3]),
         ),
         (
-            Expression::not(
-                column_expr!("number").distinct(Expression::null_literal(DataType::LONG)),
-            ),
+            Pred::not(column_expr!("number").distinct(Expr::null_literal(DataType::LONG))),
             table_for_numbers(vec![]),
         ),
         (
@@ -989,15 +972,15 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
         (
-            Expression::not(column_expr!("number").gt(empty_struct.clone())),
+            Pred::not(column_expr!("number").gt(empty_struct.clone())),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
     ];
-    for (expr, expected) in cases.into_iter() {
+    for (pred, expected) in cases.into_iter() {
         read_table_data(
             "./tests/data/basic_partitioned",
             Some(&["a_float", "number"]),
-            Some(expr),
+            Some(pred),
             expected,
         )?;
     }
@@ -1023,7 +1006,7 @@ fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
     read_table_data_str(
         "./tests/data/table-with-dv-small/",
         None,
-        Some(Expression::gt(column_expr!("value"), 3)),
+        Some(Pred::gt(column_expr!("value"), Expr::literal(3))),
         expected,
     )?;
     Ok(())
@@ -1058,15 +1041,11 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let table = Table::new(location);
 
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
-    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
-    let predicate = Expression::eq(column_expr!("id"), 2);
+    let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(predicate))
@@ -1076,7 +1055,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
 
     let mut files_scanned = 0;
     for engine_data in stream {
-        let mut result_batch = into_record_batch(engine_data?.raw_data?);
+        let mut result_batch = into_record_batch(engine_data?);
         let _ = result_batch.remove_column(result_batch.schema().index_of("id")?);
         assert_eq!(&batch, &result_batch);
         files_scanned += 1;
@@ -1121,15 +1100,11 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let table = Table::new(location);
 
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
-    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
-    let predicate = Expression::eq(column_expr!("val"), "g");
+    let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
     let scan = snapshot
         .scan_builder()
         .with_predicate(Arc::new(predicate))
@@ -1139,7 +1114,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
 
     let mut files_scanned = 0;
     for engine_data in stream {
-        let result_batch = into_record_batch(engine_data?.raw_data?);
+        let result_batch = into_record_batch(engine_data?);
         assert_eq!(&batch_2, &result_batch);
         files_scanned += 1;
     }
@@ -1280,7 +1255,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |         |",
         "+-------------------------------------------------------------------------------------------+---------+",
     ];
-    let predicate = column_expr!("missing").lt(10i64);
+    let predicate = column_expr!("missing").lt(Expr::literal(10i64));
     read_table_data_str(
         "./tests/data/parquet_row_group_skipping/",
         Some(columns),
@@ -1301,7 +1276,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |",
         "+-------------------------------------------------------------------------------------------+",
     ];
-    let predicate = column_expr!("invalid").lt(10);
+    let predicate = column_expr!("invalid").lt(Expr::literal(10));
     read_table_data_str(
         "./tests/data/parquet_row_group_skipping/",
         Some(columns),
@@ -1326,7 +1301,299 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
         "+----+-----+---+----------------------+",
     ];
     let test_name = "timestamp-partitioned-table";
-    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}
+
+#[test]
+fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = vec![
+        "+----+--------------------+",
+        "| id | comment            |",
+        "+----+--------------------+",
+        "| 0  | new                |",
+        "| 1  | after-large-delete |",
+        "| 2  |                    |",
+        "| 10 | merge1-insert      |",
+        "| 12 | merge2-insert      |",
+        "+----+--------------------+",
+    ];
+    let test_name = "compacted-log-files-table";
+    let test_dir = load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}
+
+#[test]
+fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = include!("data/unshredded-variant.expected.in");
+    let test_name = "unshredded-variant";
+    let test_dir = load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}
+
+#[tokio::test]
+async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup up an in-memory table with different numbers of rows in each file
+    let batch1 = generate_batch(vec![
+        ("id", vec![1i32, 2, 3, 4, 5].into_array()),
+        ("value", vec!["a", "b", "c", "d", "e"].into_array()),
+    ])?;
+    let batch2 = generate_batch(vec![
+        ("id", vec![10i32, 20, 30].into_array()),
+        ("value", vec!["x", "y", "z"].into_array()),
+    ])?;
+    let batch3 = generate_batch(vec![
+        ("id", vec![100i32, 200, 300, 400].into_array()),
+        ("value", vec!["p", "q", "r", "s"].into_array()),
+    ])?;
+
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::Add(PARQUET_FILE2.to_string()),
+            TestAction::Add(PARQUET_FILE3.to_string()),
+        ]),
+    )
+    .await?;
+
+    for (parquet_file, batch) in [
+        (PARQUET_FILE1, &batch1),
+        (PARQUET_FILE2, &batch2),
+        (PARQUET_FILE3, &batch3),
+    ] {
+        storage
+            .put(
+                &Path::from(parquet_file),
+                record_batch_to_bytes(batch).into(),
+            )
+            .await?;
+    }
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+
+    // Create a schema that includes a row index metadata column
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().with_schema(schema).build()?;
+
+    let mut file_count = 0;
+    let expected_row_counts = [5, 3, 4];
+    let stream = scan.execute(engine.clone())?;
+
+    for data in stream {
+        let batch = into_record_batch(data?);
+        file_count += 1;
+
+        // Verify the schema structure
+        assert_eq!(batch.num_columns(), 3, "Expected 3 columns in the batch");
+        assert_eq!(
+            batch.schema().field(0).name(),
+            "id",
+            "First column should be 'id'"
+        );
+        assert_eq!(
+            batch.schema().field(1).name(),
+            "row_index",
+            "Second column should be 'row_index'"
+        );
+        assert_eq!(
+            batch.schema().field(2).name(),
+            "value",
+            "Third column should be 'value'"
+        );
+
+        // Each file should have row indexes starting from 0 (file-local indexing)
+        let row_index_array = batch.column(1).as_primitive::<Int64Type>();
+        let expected_values: Vec<i64> = (0..batch.num_rows() as i64).collect();
+        assert_eq!(
+            row_index_array.values().to_vec(),
+            expected_values,
+            "Row index values incorrect for file {} (expected {} rows)",
+            file_count,
+            expected_row_counts[file_count - 1]
+        );
+    }
+
+    assert_eq!(file_count, 3, "Expected to scan 3 files");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::Error>> {
+    // Prepare an in-memory table with some data
+    let batch = generate_simple_batch()?;
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+        ]),
+    )
+    .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+
+    // Test that unsupported metadata columns fail with appropriate errors
+    let test_cases = [
+        (
+            "row_id",
+            MetadataColumnSpec::RowId,
+            "Row ids are not enabled on this table",
+        ),
+        (
+            "row_commit_version",
+            MetadataColumnSpec::RowCommitVersion,
+            "Row commit versions not supported",
+        ),
+    ];
+
+    for (column_name, metadata_spec, error_text) in test_cases {
+        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::create_metadata_column(column_name, metadata_spec),
+        ])?);
+
+        let scan_err = snapshot
+            .scan_builder()
+            .with_schema(schema)
+            .build()
+            .unwrap_err();
+        let error_msg = scan_err.to_string();
+        assert!(
+            error_msg.contains(error_text),
+            "Expected {error_msg} to contain {error_text}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Error>> {
+    let batch = generate_simple_batch()?;
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::Add(PARQUET_FILE2.to_string()),
+        ]),
+    )
+    .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE2),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+
+    let invalid_files = [
+        "_delta_log/0.zip",
+        "_delta_log/_copy_into_log/0.zip",
+        "_delta_log/_ignore_me/00000000000000000000.json",
+        "_delta_log/_and_me/00000000000000000000.checkpoint.parquet",
+        "_delta_log/02184.json",
+        "_delta_log/0x000000000000000000.checkpoint.parquet",
+        "00000000000000000000.json",
+        "_delta_log/_staged_commits/_staged_commits/00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        "_delta_log/my_random_dir/_staged_commits/00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        "_delta_log/my_random_dir/_delta_log/_staged_commits/00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        "_delta_log/_delta_log/00000000000000000000.json",
+        "_delta_log/_delta_log/00000000000000000000.checkpoint.parquet",
+        "_delta_log/something/_delta_log/00000000000000000000.crc",
+        "_delta_log/something/_delta_log/00000000000000000000.json",
+        "_delta_log/something/_delta_log/00000000000000000000.checkpoint.parquet",
+    ];
+
+    fn get_file_path_for_test(path: &ParsedLogPath) -> &str {
+        &path.location.location.as_str()[10..]
+    }
+
+    fn ensure_segment_does_not_contain(invalid_files: &[&str], segment: &LogSegment) {
+        assert!(
+            !segment.ascending_commit_files.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "ascending_commit_files contained invalid file"
+        );
+        assert!(
+            !segment.ascending_compaction_files.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "ascending_compaction_files contained invalid file"
+        );
+        assert!(
+            !segment.checkpoint_parts.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "checkpoint_parts contained invalid file"
+        );
+        if let Some(ref crc) = segment.latest_crc_file {
+            assert!(
+                !invalid_files.contains(&get_file_path_for_test(crc)),
+                "Latest crc contained invalid file"
+            );
+        }
+        if let Some(ref latest_commit) = segment.latest_commit_file {
+            assert!(
+                !invalid_files.contains(&get_file_path_for_test(latest_commit)),
+                "Latest commit contained invalid file"
+            );
+        }
+    }
+
+    for invalid_file in invalid_files.iter() {
+        let invalid_path = Path::from(*invalid_file);
+        storage.put(&invalid_path, vec![1u8].into()).await?;
+        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
+        storage.delete(&invalid_path).await?;
+    }
+
+    // final test with _all_ the files we should ignore
+    for invalid_file in invalid_files.iter() {
+        let invalid_path = Path::from(*invalid_file);
+        storage.put(&invalid_path, vec![1u8].into()).await?;
+    }
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
+
+    Ok(())
 }

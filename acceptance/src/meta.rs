@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::TryStreamExt;
-use object_store::{local::LocalFileSystem, ObjectStore};
+use object_store::{self, local::LocalFileSystem, ObjectStore};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{Engine, Error, Table, Version};
+use delta_kernel::{Engine, Error, Snapshot, Version};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertionError {
@@ -84,8 +83,8 @@ impl TestCaseInfo {
         assert_eq!(snapshot.version(), case.version);
 
         // assert correct metadata is read
-        let metadata = snapshot.metadata();
-        let protocol = snapshot.protocol();
+        let metadata = snapshot.table_configuration().metadata();
+        let protocol = snapshot.table_configuration().protocol();
         let tvm = TableVersionMetaData {
             version: snapshot.version(),
             properties: metadata
@@ -102,15 +101,15 @@ impl TestCaseInfo {
 
     pub async fn assert_metadata(&self, engine: Arc<dyn Engine>) -> TestResult<()> {
         let engine = engine.as_ref();
-        let table = Table::new(self.table_root()?);
-
         let (latest, versions) = self.versions().await?;
 
-        let snapshot = table.snapshot(engine, None)?;
+        let snapshot = Snapshot::builder_for(self.table_root()?).build(engine)?;
         self.assert_snapshot_meta(&latest, &snapshot)?;
 
         for table_version in versions {
-            let snapshot = table.snapshot(engine, Some(table_version.version))?;
+            let snapshot = Snapshot::builder_for(self.table_root()?)
+                .at_version(table_version.version)
+                .build(engine)?;
             self.assert_snapshot_meta(&table_version, &snapshot)?;
         }
 
@@ -147,6 +146,6 @@ mod tests {
         let path = PathBuf::from("./tests/dat/out/reader_tests/generated/with_schema_change");
         let case = read_dat_case(path).unwrap();
         let versions = case.versions().await.unwrap();
-        println!("{:?}", versions)
+        println!("{versions:?}")
     }
 }

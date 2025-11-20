@@ -3,7 +3,7 @@
 /// Since each new `.rs` file in this directory results in increased build and link time, it is
 /// important to only add new files if absolutely necessary for code readability or test
 /// performance.
-use delta_kernel::snapshot::LastCheckpointHint;
+use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
 
 #[test]
 fn test_checkpoint_serde() {
@@ -25,9 +25,9 @@ async fn test_read_last_checkpoint() {
     let url = url::Url::from_directory_path(path).unwrap();
 
     let store = Arc::new(LocalFileSystem::new());
-    let prefix = Path::from(url.path());
+    let prefix = Path::from_url_path(url.path()).unwrap();
     let storage = ObjectStoreStorageHandler::new(store, prefix);
-    let cp = read_last_checkpoint(&storage, &url).await.unwrap().unwrap();
+    let cp = LastCheckpointHint::read(&storage, &url).await.unwrap().unwrap();
     assert_eq!(cp.version, 2);
 }
 
@@ -38,9 +38,7 @@ async fn test_read_table_with_checkpoint() {
     ))
     .unwrap();
     let location = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(
-        DefaultEngine::try_new(&location, HashMap::<String, String>::new()).unwrap(),
-    );
+    let engine = test_utils::create_default_engine(&location).unwrap();
     let snapshot = Snapshot::try_new(location, engine, None)
         .await
         .unwrap();

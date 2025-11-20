@@ -2,14 +2,80 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+};
+
 use delta_kernel::arrow::error::ArrowError;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::storage::store_from_url;
+use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::EngineData;
+use delta_kernel::scan::Scan;
+use delta_kernel::schema::SchemaRef;
+use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+
 use itertools::Itertools;
+use object_store::local::LocalFileSystem;
+use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
+use serde_json::{json, to_vec};
+use url::Url;
+
+/// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
+/// dir it was unpacked into
+pub fn load_test_data(
+    test_parent_dir: &str,
+    test_name: &str,
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let path = format!("{test_parent_dir}/{test_name}.tar.zst");
+    let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
+    let mut archive = tar::Archive::new(tar);
+    let temp_dir = tempfile::tempdir()?;
+    archive.unpack(temp_dir.path())?;
+    Ok(temp_dir)
+}
+
+/// Recursively copies a directory and all its contents from source to destination.
+///
+/// This function is used to create isolated copies of test tables, enabling parallel
+/// test execution without interference. Each test gets its own copy of the table data,
+/// preventing race conditions and cross-test pollution.
+///
+/// # Arguments
+///
+/// * `source` - Path to the source directory to copy from
+/// * `dest` - Path to the destination directory (will be created if it doesn't exist)
+///
+/// # Note
+///
+/// This function copies ALL files and subdirectories, including any test artifacts
+/// that may have been created in the source directory. Ensure the source directory
+/// contains only the intended baseline data.
+pub fn copy_directory(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dest)?;
+
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let dest_path = dest.join(&file_name);
+
+        if path.is_dir() {
+            copy_directory(&path, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path)?;
+        }
+    }
+
+    Ok(())
+}
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
 pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
@@ -39,7 +105,7 @@ pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
 }
 
-fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
+pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
     actions
         .into_iter()
         .map(|test_action| match test_action {
@@ -81,6 +147,18 @@ impl IntoArray for Vec<i32> {
     }
 }
 
+impl IntoArray for Vec<i64> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(Int64Array::from(self))
+    }
+}
+
+impl IntoArray for Vec<bool> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(BooleanArray::from(self))
+    }
+}
+
 impl IntoArray for Vec<&'static str> {
     fn into_array(self) -> ArrayRef {
         Arc::new(StringArray::from(self))
@@ -112,6 +190,18 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+pub fn staged_commit_path_for_version(version: u64) -> Path {
+    let uuid = uuid::Uuid::new_v4();
+    let path = format!("_delta_log/_staged_commits/{version:020}.{uuid}.json");
+    Path::from(path.as_str())
+}
+
+/// get an ObjectStore path for a compressed log file, based on the start/end versions
+pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suffix: &str) -> Path {
+    let path = format!("_delta_log/{start_version:020}.{end_version:020}.compacted.{suffix}");
+    Path::from(path.as_str())
+}
+
 /// put a commit file into the specified object store.
 pub async fn add_commit(
     store: &dyn ObjectStore,
@@ -123,6 +213,16 @@ pub async fn add_commit(
     Ok(())
 }
 
+pub async fn add_staged_commit(
+    store: &dyn ObjectStore,
+    version: u64,
+    data: String,
+) -> Result<Path, Box<dyn std::error::Error>> {
+    let path = staged_commit_path_for_version(version);
+    store.put(&path, data.into()).await?;
+    Ok(path)
+}
+
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
 /// the default module
 pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -131,12 +231,285 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// We implement abs_diff here so we don't have to bump our msrv.
-/// TODO: Remove and use std version when msrv >= 1.81.0
-pub fn abs_diff(self_dur: std::time::Duration, other: std::time::Duration) -> std::time::Duration {
-    if let Some(res) = self_dur.checked_sub(other) {
-        res
+/// Helper to create a DefaultEngine with the default executor for tests.
+///
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine(
+    table_root: &url::Url,
+) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+    let store = store_from_url(table_root)?;
+    Ok(Arc::new(DefaultEngine::new(store)))
+}
+
+// setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
+pub fn engine_store_setup(
+    table_name: &str,
+    local_directory: Option<&Url>,
+) -> (
+    Arc<dyn ObjectStore>,
+    DefaultEngine<TokioBackgroundExecutor>,
+    Url,
+) {
+    let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
+        None => (
+            Arc::new(InMemory::new()),
+            Url::parse(format!("memory:///{table_name}/").as_str()).expect("valid url"),
+        ),
+        Some(dir) => (
+            Arc::new(LocalFileSystem::new()),
+            Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
+        ),
+    };
+    let engine = DefaultEngine::new(Arc::clone(&storage));
+
+    (storage, engine, url)
+}
+
+// we provide this table creation function since we only do appends to existing tables for now.
+// this will just create an empty table with the given schema. (just protocol + metadata actions)
+#[allow(clippy::too_many_arguments)]
+pub async fn create_table(
+    store: Arc<dyn ObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    let table_id = "test_id";
+    let schema = serde_json::to_string(&schema)?;
+
+    let protocol = if use_37_protocol {
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": reader_features,
+                "writerFeatures": writer_features,
+            }
+        })
     } else {
-        other.checked_sub(self_dur).unwrap()
+        json!({
+            "protocol": {
+                "minReaderVersion": 1,
+                "minWriterVersion": 1,
+            }
+        })
+    };
+
+    let configuration = {
+        let mut config = serde_json::Map::new();
+
+        if reader_features.contains(&"columnMapping") {
+            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+        }
+        if writer_features.contains(&"rowTracking") {
+            config.insert(
+                "delta.materializedRowIdColumnName".to_string(),
+                json!("some_dummy_column_name"),
+            );
+            config.insert(
+                "delta.materializedRowCommitVersionColumnName".to_string(),
+                json!("another_dummy_column_name"),
+            );
+        }
+        if writer_features.contains(&"inCommitTimestamp") {
+            config.insert("delta.enableInCommitTimestamps".to_string(), json!("true"));
+            config.insert(
+                "delta.inCommitTimestampEnablementVersion".to_string(),
+                json!("0"),
+            );
+            config.insert(
+                "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                json!("1612345678"),
+            );
+        }
+        if writer_features.contains(&"changeDataFeed") {
+            config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
+
+        config
+    };
+
+    let metadata = json!({
+        "metaData": {
+            "id": table_id,
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": schema,
+            "partitionColumns": partition_columns,
+            "configuration": configuration,
+            "createdTime": 1677811175819u64
+        }
+    });
+
+    // Add commitInfo with ICT if ICT is enabled
+    let commit_info = if writer_features.contains(&"inCommitTimestamp") {
+        // When ICT is enabled from version 0, we need to include it in the initial commit
+        let timestamp = 1612345678i64; // Use a fixed timestamp for testing
+        Some(json!({
+            "commitInfo": {
+                "timestamp": timestamp,
+                "inCommitTimestamp": timestamp,
+                "operation": "CREATE TABLE",
+                "operationParameters": {},
+                "isBlindAppend": true
+            }
+        }))
+    } else {
+        None
+    };
+
+    let data = if let Some(commit_info) = commit_info {
+        [
+            to_vec(&commit_info).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&protocol).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&metadata).unwrap(),
+        ]
+        .concat()
+    } else {
+        [
+            to_vec(&protocol).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&metadata).unwrap(),
+        ]
+        .concat()
+    };
+
+    // put 0.json with protocol + metadata
+    let path = table_path.join("_delta_log/00000000000000000000.json")?;
+
+    store
+        .put(&Path::from_url_path(path.path())?, data.into())
+        .await?;
+    Ok(table_path)
+}
+
+/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.
+/// the tables will be named {table_base_name}_11 and table_base_name}_37. The local_directory param
+/// can be set to write out the tables to the local filesystem, passing in None will create in-memory tables
+pub async fn setup_test_tables(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    local_directory: Option<&Url>,
+    table_base_name: &str,
+) -> Result<
+    Vec<(
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<dyn ObjectStore>,
+        &'static str,
+    )>,
+    Box<dyn std::error::Error>,
+> {
+    let table_name_11 = format!("{table_base_name}_11");
+    let table_name_37 = format!("{table_base_name}_37");
+    let (store_11, engine_11, table_location_11) =
+        engine_store_setup(table_name_11.as_str(), local_directory);
+    let (store_37, engine_37, table_location_37) =
+        engine_store_setup(table_name_37.as_str(), local_directory);
+    Ok(vec![
+        (
+            create_table(
+                store_37.clone(),
+                table_location_37,
+                schema.clone(),
+                partition_columns,
+                true,
+                vec![],
+                vec![],
+            )
+            .await?,
+            engine_37,
+            store_37,
+            "test_table_37",
+        ),
+        (
+            create_table(
+                store_11.clone(),
+                table_location_11,
+                schema,
+                partition_columns,
+                false,
+                vec![],
+                vec![],
+            )
+            .await?,
+            engine_11,
+            store_11,
+            "test_table_11",
+        ),
+    ])
+}
+
+pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
+    Ok(data
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+        .into())
+}
+
+pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
+    let scan_results = scan.execute(engine)?;
+    scan_results
+        .map(|data| -> DeltaResult<_> {
+            let data = data?;
+            to_arrow(data)
+        })
+        .try_collect()
+}
+
+pub fn test_read(
+    expected: &ArrowEngineData,
+    url: &Url,
+    engine: Arc<dyn Engine>,
+) -> DeltaResult<()> {
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+    let formatted = pretty_format_batches(&batches).unwrap().to_string();
+
+    let expected = pretty_format_batches(&[expected.record_batch().clone()])
+        .unwrap()
+        .to_string();
+
+    println!("actual:\n{formatted}");
+    println!("expected:\n{expected}");
+    assert_eq!(formatted, expected);
+
+    Ok(())
+}
+
+// Helper function to set json values in a serde_json Values
+pub fn set_json_value(
+    value: &mut serde_json::Value,
+    path: &str,
+    new_value: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut path_string = path.replace(".", "/");
+    path_string.insert(0, '/');
+    let v = value
+        .pointer_mut(&path_string)
+        .ok_or_else(|| format!("key '{path}' not found"))?;
+    *v = new_value;
+    Ok(())
+}
+
+pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+    match res {
+        Ok(_) => panic!("Expected error, but got Ok result"),
+        Err(error) => {
+            let error_str = error.to_string();
+            assert!(
+                error_str.contains(message),
+                "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
+            );
+        }
     }
 }
