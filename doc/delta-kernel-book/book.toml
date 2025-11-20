@@ -1,5 +1,9 @@
 [book]
 language = "en"
-multilingual = false
 src = "src"
 title = "Delta Kernel Documentation"
+
+[output.html]
+additional-css = ["./theme/catppuccin.css"]
+default-theme = "latte"
+preferred-dark-theme = "macchiato"

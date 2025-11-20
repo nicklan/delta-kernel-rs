@@ -4,6 +4,7 @@
 
 # User guide
 - [Quick Start](./quick_start.md)
+- [The Engine Trait System](./engine_trait.md)
 - [Examples](./examples.md)
     - [read_table_multi_threaded example](./read_table_multi_threaded.md)
     - [inspect_table example](./inspect_table.md)
