@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
-use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
+use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumIter, EnumString};
 
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
@@ -27,6 +27,7 @@ mod timestamp_ntz;
 /// There are no Reader only features. See `TableFeature::feature_type` for the category of each.
 ///
 /// The kernel currently supports all reader features except `V2Checkpoint`.
+#[internal_api]
 #[derive(
     Serialize,
     Deserialize,
@@ -38,11 +39,11 @@ mod timestamp_ntz;
     StrumDisplay,
     AsRefStr,
     EnumCount,
+    EnumIter,
     Hash,
 )]
 #[strum(serialize_all = "camelCase")]
 #[serde(rename_all = "camelCase")]
-#[internal_api]
 pub(crate) enum TableFeature {
     //////////////////////////
     // Writer-only features //
@@ -160,6 +161,7 @@ pub(crate) enum EnablementCheck {
 /// Represents the type of data being accessed in an operation (used with both read and write)
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[internal_api]
 pub(crate) enum Operation {
     /// Operations on regular table data
     Scan,
@@ -170,6 +172,7 @@ pub(crate) enum Operation {
 /// Defines whether the Rust kernel has implementation support for a feature's operation
 #[allow(dead_code)]
 #[derive(Clone)]
+#[internal_api]
 pub(crate) enum KernelSupport {
     /// Kernel has full support for any operation on this feature
     Supported,
@@ -200,6 +203,7 @@ pub(crate) enum FeatureRequirement {
 /// Rich metadata about a table feature including version requirements, dependencies, and support status
 #[allow(dead_code)]
 #[derive(Clone)]
+#[internal_api]
 pub(crate) struct FeatureInfo {
     /// The feature's canonical name as it appears in the protocol
     pub name: &'static str,
@@ -626,6 +630,7 @@ impl TableFeature {
     /// Returns rich metadata about this table feature including version requirements,
     /// dependencies, and support status. For Unknown features, returns None.
     #[allow(dead_code)]
+    #[internal_api]
     pub(crate) fn info(&self) -> Option<&'static FeatureInfo> {
         match self {
             // Writer-only features

@@ -170,3 +170,8 @@ harness = false
 [[bench]]
 name = "expression_bench"
 harness = false
+
+
+[[bin]]
+name = "dump_supported_features"
+required-features = ["internal-api"]
