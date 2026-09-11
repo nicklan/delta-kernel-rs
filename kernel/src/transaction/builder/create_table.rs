@@ -540,7 +540,8 @@ fn require_iceberg_compat_column_mapping(
 ///
 /// Specifically:
 ///   * Set `delta.columnMapping.mode` to `name` when absent, reject if it's `none`.
-///   * Reject if `delta.enableIcebergCompatV1` or `delta.enableIcebergCompatV3` is `true`.
+///   * Reject if `delta.enableIcebergCompatV1`, `delta.enableIcebergCompatV3`, or
+///     `delta.enableDeletionVectors` is `true`.
 fn maybe_enable_iceberg_compat_v2_dependencies(
     validated: &mut ValidatedTableProperties,
 ) -> DeltaResult<()> {
@@ -550,8 +551,12 @@ fn maybe_enable_iceberg_compat_v2_dependencies(
 
     require_iceberg_compat_column_mapping(validated, "IcebergCompatV2")?;
 
-    // V1/V3 must not be active.
-    for key in [ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3] {
+    // V1/V3 and deletion vectors must not be active.
+    for key in [
+        ENABLE_ICEBERG_COMPAT_V1,
+        ENABLE_ICEBERG_COMPAT_V3,
+        ENABLE_DELETION_VECTORS,
+    ] {
         if validated.is_property_true(key) {
             return Err(Error::generic(format!(
                 "IcebergCompatV2 cannot be enabled together with '{key}'"
@@ -2300,6 +2305,10 @@ mod tests {
     #[case::cm_mode_none(&[(COLUMN_MAPPING_MODE, "none")], "delta.columnMapping.mode")]
     #[case::v1_concurrent(&[(ENABLE_ICEBERG_COMPAT_V1, "true")], "delta.enableIcebergCompatV1")]
     #[case::v3_concurrent(&[(ENABLE_ICEBERG_COMPAT_V3, "true")], "delta.enableIcebergCompatV3")]
+    #[case::deletion_vectors_enabled(
+        &[(ENABLE_DELETION_VECTORS, "true")],
+        "delta.enableDeletionVectors",
+    )]
     fn test_v2_dependencies_rejects_invalid_combinations(
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_substring: &str,
