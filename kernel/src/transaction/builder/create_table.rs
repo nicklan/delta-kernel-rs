@@ -510,20 +510,10 @@ fn maybe_enable_v2_checkpoint_for_policy(validated: &mut ValidatedTablePropertie
     }
 }
 
-/// When `delta.enableIcebergCompatV2=true` is set, auto-enables V2's required dependencies in
-/// `validated.properties` (defaulting them when absent, rejecting conflicting values).
-///
-/// Specifically:
-///   * Set `delta.columnMapping.mode` to `name` when absent, reject if it's `none`.
-///   * Reject if `delta.enableIcebergCompatV1` or `delta.enableIcebergCompatV3` is `true`.
-fn maybe_enable_iceberg_compat_v2_dependencies(
+fn require_iceberg_compat_column_mapping(
     validated: &mut ValidatedTableProperties,
+    feature_name: &str,
 ) -> DeltaResult<()> {
-    if !validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2) {
-        return Ok(());
-    }
-
-    // Column mapping: require `name` or `id`; default to `name`.
     match validated
         .properties
         .get(COLUMN_MAPPING_MODE)
@@ -537,11 +527,28 @@ fn maybe_enable_iceberg_compat_v2_dependencies(
         Some("name") | Some("id") => {}
         Some(other) => {
             return Err(Error::generic(format!(
-                "IcebergCompatV2 requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
+                "{feature_name} requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
                  '{other}'"
             )));
         }
     }
+    Ok(())
+}
+
+/// When `delta.enableIcebergCompatV2=true` is set, auto-enables V2's required dependencies in
+/// `validated.properties` (defaulting them when absent, rejecting conflicting values).
+///
+/// Specifically:
+///   * Set `delta.columnMapping.mode` to `name` when absent, reject if it's `none`.
+///   * Reject if `delta.enableIcebergCompatV1` or `delta.enableIcebergCompatV3` is `true`.
+fn maybe_enable_iceberg_compat_v2_dependencies(
+    validated: &mut ValidatedTableProperties,
+) -> DeltaResult<()> {
+    if !validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2) {
+        return Ok(());
+    }
+
+    require_iceberg_compat_column_mapping(validated, "IcebergCompatV2")?;
 
     // V1/V3 must not be active.
     for key in [ENABLE_ICEBERG_COMPAT_V1, ENABLE_ICEBERG_COMPAT_V3] {
@@ -570,25 +577,7 @@ fn maybe_enable_iceberg_compat_v3_dependencies(
         return Ok(());
     }
 
-    // Column mapping: require `name` or `id`; default to `name`.
-    match validated
-        .properties
-        .get(COLUMN_MAPPING_MODE)
-        .map(String::as_str)
-    {
-        None => {
-            validated
-                .properties
-                .insert(COLUMN_MAPPING_MODE.to_string(), "name".to_string());
-        }
-        Some("name") | Some("id") => {}
-        Some(other) => {
-            return Err(Error::generic(format!(
-                "IcebergCompatV3 requires '{COLUMN_MAPPING_MODE}' to be 'name' or 'id', got \
-                 '{other}'"
-            )));
-        }
-    }
+    require_iceberg_compat_column_mapping(validated, "IcebergCompatV3")?;
 
     // Row tracking must not be suspended (suspension cannot coexist with row tracking actively
     // enabled, which V3 requires).
