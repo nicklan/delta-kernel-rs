@@ -424,6 +424,18 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
 /// See
 /// <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2>
 /// for more requirements to support.
+///
+/// TODO(#1125): Implement the schema-evolution requirements for IcebergCompatV2.
+/// TODO: Support ALTER TABLE on tables with IcebergCompatV2 enabled.
+///
+/// Requirements to enforce when the corresponding write paths are supported:
+/// - REPLACE TABLE: when supported, partition columns must not change across the replace.
+/// - Timestamp parquet encoding: if/when kernel can write INT96 or INT64, IcebergCompatV2 tables must
+///   always use INT64; INT96 is forbidden.
+/// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
+///   disable IcebergCompatV2 on an existing table.
+///
+/// Tracking issue: <https://github.com/delta-io/delta-kernel-rs/issues/1125>
 static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
