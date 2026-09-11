@@ -222,6 +222,25 @@ fn v2_create_table_enables_column_mapping_and_nested_ids() -> DeltaResult<()> {
 }
 
 #[test]
+fn v2_create_table_rejects_active_deletion_vectors() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup()?;
+
+    let err = create_table(&table_path, super::simple_schema()?, "Test/1.0")
+        .with_table_properties([
+            ("delta.enableIcebergCompatV2", "true"),
+            ("delta.enableDeletionVectors", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("IcebergCompatV2") && err.contains("delta.enableDeletionVectors"),
+        "expected V2/deletion-vector conflict, got: {err}",
+    );
+    Ok(())
+}
+
+#[test]
 fn v2_create_table_rejects_unsupported_type_change() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let widened = StructField::nullable("value", DataType::DOUBLE).add_metadata([(
