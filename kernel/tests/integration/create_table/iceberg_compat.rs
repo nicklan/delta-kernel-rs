@@ -222,7 +222,7 @@ fn v2_create_table_enables_column_mapping_and_nested_ids() -> DeltaResult<()> {
 }
 
 #[test]
-fn v2_existing_table_transaction_rejects_unsupported_type_change() -> DeltaResult<()> {
+fn v2_create_table_rejects_unsupported_type_change() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup()?;
     let widened = StructField::nullable("value", DataType::DOUBLE).add_metadata([(
         ColumnMetadataKey::TypeChanges.as_ref(),
@@ -234,17 +234,13 @@ fn v2_existing_table_transaction_rejects_unsupported_type_change() -> DeltaResul
     )]);
     let schema = schema_ref! { (widened) };
 
-    let _ = create_table(&table_path, schema, "Test/1.0")
+    let result = create_table(&table_path, schema, "Test/1.0")
         .with_table_properties([
             ("delta.enableIcebergCompatV2", "true"),
             ("delta.enableTypeWidening", "true"),
         ])
-        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
-        .commit(engine.as_ref())?;
-
-    let snapshot = Snapshot::builder_for(&table_path).build(engine.as_ref())?;
-    let result = snapshot.transaction(Box::new(FileSystemCommitter::new()), engine.as_ref());
-    let err = result.expect_err("V2 transaction should reject the type change");
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+    let err = result.expect_err("V2 CREATE should reject the type change");
     assert!(
         err.to_string()
             .contains("icebergCompatV2 does not support type change"),
