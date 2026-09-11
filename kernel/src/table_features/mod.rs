@@ -430,8 +430,8 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
 ///
 /// Requirements to enforce when the corresponding write paths are supported:
 /// - REPLACE TABLE: when supported, partition columns must not change across the replace.
-/// - Timestamp parquet encoding: if/when kernel can write INT96 or INT64, IcebergCompatV2 tables must
-///   always use INT64; INT96 is forbidden.
+/// - Timestamp parquet encoding: if/when kernel can write INT96 or INT64, IcebergCompatV2 tables
+///   must always use INT64; INT96 is forbidden.
 /// - ALTER TABLE SET/UNSET TBLPROPERTIES: when supported, reject any property change that would
 ///   disable IcebergCompatV2 on an existing table.
 ///

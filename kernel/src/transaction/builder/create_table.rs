@@ -1927,7 +1927,7 @@ mod tests {
         );
     }
 
-    /// Builds the icebergCompatV3 create-table test schema:
+    /// Builds the Iceberg compatibility create-table test schema:
     ///
     /// ```json
     /// {
@@ -1949,7 +1949,7 @@ mod tests {
     ///   ]
     /// }
     /// ```
-    fn build_iceberg_compat_v3_test_schema() -> SchemaRef {
+    fn build_iceberg_compat_test_schema() -> SchemaRef {
         let with_metadata =
             build_complex_nested_kernel_schema(ColumnMetadataKey::ColumnMappingNestedIds.as_ref());
         let complex = StripFieldMetadataTransform
@@ -2000,7 +2000,7 @@ mod tests {
         #[case] extra_props: &[(&str, &str)],
         #[case] expected_features: &[TableFeature],
     ) {
-        let schema = build_iceberg_compat_v3_test_schema();
+        let schema = build_iceberg_compat_test_schema();
         let mut props: HashMap<String, String> =
             HashMap::from([(ENABLE_ICEBERG_COMPAT_V3.to_string(), "true".to_string())]);
         for (k, v) in extra_props {
@@ -2176,7 +2176,7 @@ mod tests {
     /// applied per the explicit property, but no nested ids are set on Array/Map fields.
     #[test]
     fn test_create_table_v3_supported_but_not_enabled_skips_nested_ids() {
-        let schema = build_iceberg_compat_v3_test_schema();
+        let schema = build_iceberg_compat_test_schema();
         let mut validated = validate_extract_table_features_and_properties(HashMap::from([
             (
                 "delta.feature.icebergCompatV3".to_string(),
@@ -2214,7 +2214,7 @@ mod tests {
     /// V2 create-table flow: IcebergCompatV2 must assign nested ids for Array/Map fields.
     #[test]
     fn test_create_table_iceberg_compat_v2() {
-        let schema = build_iceberg_compat_v3_test_schema();
+        let schema = build_iceberg_compat_test_schema();
         let props: HashMap<String, String> =
             HashMap::from([(ENABLE_ICEBERG_COMPAT_V2.to_string(), "true".to_string())]);
         let mut validated = validate_extract_table_features_and_properties(props).unwrap();
