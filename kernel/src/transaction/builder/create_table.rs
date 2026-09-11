@@ -535,8 +535,8 @@ fn require_iceberg_compat_column_mapping(
     Ok(())
 }
 
-/// When `delta.enableIcebergCompatV2=true` is set, auto-enables V2's required dependencies in
-/// `validated.properties` (defaulting them when absent, rejecting conflicting values).
+/// Adds Column Mapping protocol support whenever IcebergCompatV2 is supported. When
+/// `delta.enableIcebergCompatV2=true`, also enables and validates V2's property dependencies.
 ///
 /// Specifically:
 ///   * Set `delta.columnMapping.mode` to `name` when absent, reject if it's `none`.
@@ -545,7 +545,21 @@ fn require_iceberg_compat_column_mapping(
 fn maybe_enable_iceberg_compat_v2_dependencies(
     validated: &mut ValidatedTableProperties,
 ) -> DeltaResult<()> {
-    if !validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2) {
+    let enabled = validated.is_property_true(ENABLE_ICEBERG_COMPAT_V2);
+    if !enabled
+        && !validated
+            .writer_features
+            .contains(&TableFeature::IcebergCompatV2)
+    {
+        return Ok(());
+    }
+
+    add_feature_to_lists(
+        TableFeature::ColumnMapping,
+        &mut validated.reader_features,
+        &mut validated.writer_features,
+    );
+    if !enabled {
         return Ok(());
     }
 
@@ -2297,6 +2311,35 @@ mod tests {
                 .map(String::as_str),
             expected_cm,
         );
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::ColumnMapping)
+                && validated
+                    .writer_features
+                    .contains(&TableFeature::ColumnMapping)
+        );
+    }
+
+    #[test]
+    fn test_v2_support_adds_column_mapping_support_without_enabling_mode() {
+        let mut validated = ValidatedTableProperties {
+            properties: HashMap::new(),
+            reader_features: Vec::new(),
+            writer_features: vec![TableFeature::IcebergCompatV2],
+        };
+
+        maybe_enable_iceberg_compat_v2_dependencies(&mut validated).unwrap();
+
+        assert!(
+            validated
+                .reader_features
+                .contains(&TableFeature::ColumnMapping)
+                && validated
+                    .writer_features
+                    .contains(&TableFeature::ColumnMapping)
+        );
+        assert!(!validated.properties.contains_key(COLUMN_MAPPING_MODE));
     }
 
     /// Property combinations that violate V2's dependency requirements must be rejected by
