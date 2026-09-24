@@ -1,5 +1,4 @@
 //! Default Parquet handler implementation
-#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::num::NonZero;
@@ -23,10 +22,12 @@ use delta_kernel::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
 };
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
-use delta_kernel::parquet::arrow::async_reader::{
-    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
-};
-use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+#[allow(deprecated)]
+use delta_kernel::parquet::arrow::async_reader::ParquetObjectReader;
+use delta_kernel::parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+use delta_kernel::parquet::arrow::async_writer::AsyncArrowWriter;
+#[allow(deprecated)]
+use delta_kernel::parquet::arrow::async_writer::ParquetObjectWriter;
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
@@ -384,6 +385,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
 
+            #[allow(deprecated)]
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = first_record_batch.schema();
             let mut writer =
@@ -433,6 +435,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
+                #[allow(deprecated)]
                 let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
@@ -462,6 +465,7 @@ async fn open_parquet_file(
     let file_location = file_meta.location.to_string();
     let path = Path::from_url_path(file_meta.location.path())?;
 
+    #[allow(deprecated)]
     let mut reader = {
         use delta_kernel::object_store::ObjectStoreScheme;
         // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
@@ -722,6 +726,7 @@ mod tests {
     async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
         let path = Path::from_url_path(file_meta.location.path()).unwrap();
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -790,6 +795,7 @@ mod tests {
         // Baseline: how many `get_opts` calls a single footer load makes (one or more range GETs,
         // depending on parquet version). The reader builder must not exceed this.
         let baseline_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
+        #[allow(deprecated)]
         let mut reader =
             ParquetObjectReader::new(baseline_store.clone(), location).with_file_size(file_size);
         let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options())
@@ -840,6 +846,7 @@ mod tests {
         let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store.clone(), location);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1111,6 +1118,7 @@ mod tests {
 
         // check we can read back
         let path = Path::from_url_path(location.path()).unwrap();
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1196,6 +1204,7 @@ mod tests {
         // Verify we can read the file back
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1247,6 +1256,7 @@ mod tests {
 
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1398,6 +1408,7 @@ mod tests {
         // Read it back
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -1743,6 +1754,7 @@ mod tests {
             .unwrap();
 
         let path = Path::from_url_path(metadata.file_meta.location.path()).unwrap();
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store, path);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
         let kv = builder.metadata().file_metadata().key_value_metadata();
@@ -1788,6 +1800,7 @@ mod tests {
         assert!(nested_path.exists());
 
         let path = Path::from_url_path(file_url.path()).unwrap();
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(store.clone(), path);
         let batches: Vec<RecordBatch> = ParquetRecordBatchStreamBuilder::new(reader)
             .await
