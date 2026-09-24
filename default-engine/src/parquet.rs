@@ -1,4 +1,5 @@
 //! Default Parquet handler implementation
+#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::num::NonZero;
